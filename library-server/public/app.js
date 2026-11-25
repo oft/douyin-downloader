@@ -15,7 +15,11 @@ const issueNames = {
 };
 const reviewNames = { pending: '待处理', resolved: '已处理', ignored: '已忽略' };
 const issueViews = { ...reviewNames, cleared: '复扫已消除', all: '全部记录' };
-const headings = { works: '全部作品', authors: '全部作者', issues: '数据异常', links: '链接管理' };
+const headings = { works: '全部作品', authors: '全部作者', issues: '数据异常', links: '链接管理', update: '下载更新' };
+const updateStates = {
+    idle: '空闲', starting: '正在启动', running: '更新中', stopping: '正在停止',
+    stopped: '已停止', completed: '已完成', failed: '更新失败',
+};
 const date = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' });
 const jsonHeaders = { 'Content-Type': 'application/json' };
 let status = {};
@@ -38,6 +42,8 @@ let linkAuthors = {};
 let linkDraft = [];
 let linkQuery = '';
 let savingLinks = false;
+let updateTimer;
+let updateVersion = 0;
 
 function escape(value = '') {
     const replacements = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
@@ -417,8 +423,75 @@ async function saveLinks(event) {
     }
 }
 
+function showUpdate() {
+    results.setAttribute('aria-busy', 'false');
+    byId('summary').textContent = '按已保存的链接运行一轮下载。';
+    results.innerHTML = `<section class="update-panel" aria-label="下载任务">
+        <div class="update-controls">
+            <div>
+                <div class="summary">当前状态</div>
+                <div id="update-state" class="update-state" role="status">正在读取状态…</div>
+            </div>
+            <div class="form-actions">
+                <button class="primary" type="button" data-update-action="start" disabled>启动更新</button>
+                <button class="secondary danger" type="button" data-update-action="stop" disabled>停止更新</button>
+            </div>
+        </div>
+        <p id="update-details" class="summary" hidden></p>
+        <p id="update-error" role="alert" hidden></p>
+    </section>`;
+    void refreshUpdate();
+}
+
+async function refreshUpdate(action) {
+    clearTimeout(updateTimer);
+    const version = ++updateVersion;
+    const current = () => version === updateVersion && route.view === 'update';
+    const state = byId('update-state');
+    const details = byId('update-details');
+    const message = byId('update-error');
+    const start = results.querySelector('[data-update-action="start"]');
+    const stop = results.querySelector('[data-update-action="stop"]');
+    if (action) start.disabled = stop.disabled = true;
+
+    try {
+        const next = action
+            ? await api(`update/${action}`, { method: 'POST', headers: jsonHeaders, body: '{}' })
+            : await api('update');
+        if (!current()) return;
+        const previous = state.dataset.state;
+        const active = ['starting', 'running', 'stopping'].includes(next.state);
+        if (previous !== next.state) state.textContent = updateStates[next.state];
+        state.dataset.state = next.state;
+        start.disabled = active;
+        stop.disabled = !active || next.state === 'stopping';
+        details.textContent = [
+            next.startedAt && `开始于 ${date.format(new Date(next.startedAt))}`,
+            next.finishedAt && `结束于 ${date.format(new Date(next.finishedAt))}`,
+        ].filter(Boolean).join(' · ');
+        details.hidden = !details.textContent;
+        const error = next.error ?? '';
+        if (message.textContent !== error) message.textContent = error;
+        message.hidden = !error;
+        if (next.finishedAt && previous !== next.state) void refreshStatus();
+    } catch (error) {
+        if (!current()) return;
+        if (action) showToast(error.message, true);
+        else {
+            if (state.dataset.state !== 'unavailable') state.textContent = '状态不可用';
+            state.dataset.state = 'unavailable';
+            start.disabled = stop.disabled = true;
+            if (message.textContent !== error.message) message.textContent = error.message;
+            message.hidden = false;
+        }
+    } finally {
+        if (current()) updateTimer = setTimeout(() => void refreshUpdate(), 1500);
+    }
+}
+
 function navigate() {
     clearTimeout(searchTimer);
+    clearTimeout(updateTimer);
     if (modal.open) modal.close();
     ++listVersion;
     workListPage = undefined;
@@ -437,7 +510,11 @@ function navigate() {
     byId('summary').textContent = '';
     byId('header-action').replaceChildren();
     pager.hidden = true;
-    if (view === 'links') {
+    if (view === 'update') {
+        toolbar.hidden = true;
+        showUpdate();
+        void refreshStatus();
+    } else if (view === 'links') {
         toolbar.hidden = true;
         void loadLinks();
     } else {
@@ -488,7 +565,7 @@ async function refreshStatus({ rescan = false, scanIfNeeded = false } = {}) {
         if (version !== scanStatusVersion) return;
         status = next;
         renderStatus();
-        if ((route.view === 'issues' || (route.view !== 'links' && (rescan || previous.scanning))) &&
+        if ((route.view === 'issues' || (['works', 'authors'].includes(route.view) && (rescan || previous.scanning))) &&
             status.scannedAt && status.scannedAt !== previous.scannedAt) void loadList({ showLoading: !previous.scannedAt });
         if (status.scanning) scanTimer = setTimeout(() => void refreshStatus(), 800);
         if (previous.scanning && !status.scanning && status.error && status.scannedAt) showToast(status.error, true);
@@ -848,6 +925,7 @@ results.addEventListener('click', event => {
     if (item.hasAttribute('data-retry')) void loadList({ showLoading: true });
     if (item.hasAttribute('data-rescan')) void refreshStatus({ rescan: true });
     if (item.hasAttribute('data-reload-links')) void loadLinks({ reload: true });
+    if (item.dataset.updateAction) void refreshUpdate(item.dataset.updateAction);
     if (item.hasAttribute('data-remove-link')) {
         const index = Number(item.dataset.removeLink);
         linkDraft.splice(index, 1);

@@ -15,10 +15,15 @@ import { ReviewStore } from './util/reviews.ts';
 import type { ReviewStatus } from './util/reviews.ts';
 import { deletePermanently, removalPlan } from './util/library-files.ts';
 import type { RemovalKind } from './util/library-files.ts';
+import { resolveUpdatePython, UpdateJob } from './util/update-job.ts';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
-const configFile = process.env.CONFIG_PATH ? path.resolve(process.env.CONFIG_PATH) : path.join(directory, '..', 'config.yml');
+const projectRoot = path.dirname(directory);
+const configFile = process.env.CONFIG_PATH ? path.resolve(process.env.CONFIG_PATH) : path.join(projectRoot, 'config.yml');
 const { downloadRoot, databaseFile } = readLibraryConfig(configFile);
+const updateJob = new UpdateJob(resolveUpdatePython(projectRoot), [
+    '-u', path.join(directory, 'scripts', 'update-library.py'), configFile, downloadRoot, databaseFile,
+], projectRoot);
 const reviewFile = process.env.CATALOG_REVIEW_FILE ? path.resolve(process.env.CATALOG_REVIEW_FILE) : path.join(directory, 'data', 'catalog-reviews.json');
 const reviewStatuses = ['pending', 'resolved', 'ignored'] as const;
 const sources: Source[] = ['post', 'like', 'mix', 'music', 'single', 'loose'];
@@ -234,6 +239,27 @@ app.put('/api/catalog/links', async c => {
 
 app.get('/api/catalog/status', async c => c.json(await currentStatus()));
 
+app.use('/api/catalog/update/*', async (c, next) => {
+    if (!isLocalRequest(c)) return c.json({ error: '下载更新仅支持本机同源请求' }, 403);
+    if (c.req.method === 'POST' && !/^application\/json(?:\s*;|$)/i.test(c.req.header('Content-Type') ?? '')) {
+        return c.json({ error: '需要 JSON 请求' }, 415);
+    }
+    await next();
+});
+
+app.get('/api/catalog/update', c => c.json(updateJob.status));
+app.post('/api/catalog/update/start', c => {
+    if (updateJob.active) return c.json(updateJob.status, 202);
+    if (removing) return c.json({ error: '正在删除文件，请稍后再启动更新' }, 409);
+    try {
+        if (!readConfigLinks(configFile).links.some(link => link.trim())) {
+            return c.json({ error: '请先在链接管理中添加链接并保存配置' }, 422);
+        }
+    } catch (error) { return linkConfigFailure(c, error, '无法读取下载器配置'); }
+    return c.json(updateJob.start(), 202);
+});
+app.post('/api/catalog/update/stop', c => c.json(updateJob.stop(), 202));
+
 app.post('/api/catalog/scan', async c => {
     if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: '需要 JSON 请求' }, 415);
     if (removing) return c.json({ error: '正在删除文件，请稍后再扫描' }, 409);
@@ -391,6 +417,7 @@ function previewRemoval(c: Context, kind: RemovalKind, ids: string[], authorId?:
 }
 
 async function commitRemoval(c: Context, kind: RemovalKind, ids: string[], token: string, authorId?: string) {
+    if (updateJob.active) return c.json({ error: '正在下载更新，请在更新结束后再删除' }, 409);
     if (scan || removing) return c.json({ error: '索引正在更新，请稍后再试' }, 409);
     removing = true;
     let attempted = false;

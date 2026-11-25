@@ -223,7 +223,7 @@ async def download_url(
         return result
 
 
-async def main_async(args):
+async def main_async(args, *, database_path=None, on_download_ready=None):
     if not args.serve:
         display.show_banner()
 
@@ -288,8 +288,10 @@ async def main_async(args):
         display.print_warning("Cookies may be invalid or incomplete")
 
     database = None
-    if config.get("database"):
-        db_path = config.get("database_path", "dy_downloader.db") or "dy_downloader.db"
+    if database_path is not None or config.get("database"):
+        db_path = (
+            database_path or config.get("database_path", "dy_downloader.db") or "dy_downloader.db"
+        )
         database = Database(db_path=str(db_path), download_root=config.get("path"))
         await database.initialize()
         display.print_success("Database initialized")
@@ -311,6 +313,8 @@ async def main_async(args):
 
     display.start_download_session(len(urls))
     try:
+        if on_download_ready is not None:
+            on_download_ready()
         for i, url in enumerate(urls, 1):
             display.start_url(i, len(urls), url)
 

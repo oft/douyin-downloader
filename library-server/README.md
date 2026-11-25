@@ -21,8 +21,25 @@ npm start
 - **作者**基于数据库中的作者 ID 和昵称归并。喜欢、合集等作品按数据库记录的创作者展示。作者总览和作者详情均可切换卡片与列表，分别勾选作者或作品进行批量删除。详情页的「删除链接」可确认并移除配置中匹配的作者主页链接。
 - **异常**首次打开异常页或点击「扫描媒体异常」时检查全库。复核时可保存备注，标记已处理或已忽略。已有复核的记录会在复扫后保留，已修复的可在「复扫已消除」查看。
 - **链接管理**搜索、添加、编辑或移除下载器配置中的 `link` 条目。点击「保存配置」后，下载器下次启动时会读取新列表。可通过 `CONFIG_PATH` 指定编辑的配置文件。
+- **更新**读取已保存的链接，启动一轮下载。页面自动显示当前状态、开始时间、结束时间及失败原因，也可停止当前一轮下载。关闭页面后任务继续运行。更新使用当前资料库的下载目录和数据库。
 
 通过 `CONFIG_PATH` 可指定下载器配置文件。通过 `DATABASE_PATH` 可指定作品数据库，通过 `DOWNLOAD_ROOT` 可指定媒体根目录，通过 `PORT` 可修改端口。媒体、JSON、封面和头像的路径相对于下载根目录保存。打开作品详情时按需读取对应 JSON 文件，检查图集时使用 `image_count` 字段核对图片数量。复核记录保存在 `data/catalog-reviews.json`。浏览和扫描使用只读数据库连接。
+
+下载更新需要安装下载器的 Python 依赖。资料库优先使用 `PYTHON_EXECUTABLE` 指定的解释器，其次查找仓库根目录的 `.venv`，最后在 Windows 使用 `python`，其他系统使用 `python3`。下载日志显示在启动资料库的终端。
+
+在 Windows 上，可使用带 `venv` 模块的 Python 在仓库根目录创建虚拟环境并安装依赖。
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+如果使用作者作品的浏览器回补，再安装 Playwright 和 Chromium。
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install 'playwright>=1.40.0'
+.\.venv\Scripts\python.exe -m playwright install chromium
+```
 
 ## 永久删除
 
