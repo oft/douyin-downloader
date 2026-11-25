@@ -8,14 +8,17 @@ import random
 import re
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import aiohttp
 
 from auth import MsTokenManager
+from core.browser_session import BrowserSession
 from core.live_streams import flight_text_rows, inline_stream_data
+from utils.browser_runtime import chromium_launch_options
 from utils.cookie_utils import sanitize_cookies
 from utils.logger import safe_log_url, setup_logger
 from utils.xbogus import XBogus
@@ -66,6 +69,36 @@ _ERROR_BODY_READ_TIMEOUT_SECONDS = 2.0
 # 作者主页「合集」的 series/list 分支:整份列表在 get_user_mix 的第一页里取完,
 # 页数上限兜住 has_more 恒为 1 的异常响应(每页 20 条 => 最多 200 个合集)。
 _SERIES_LIST_MAX_PAGES = 10
+
+_UNAVAILABLE_USER_MESSAGES = (
+    "用户不存在",
+    "该用户不存在",
+    "账号已注销",
+    "该账号已注销",
+    "账号已被封禁",
+    "该账号已被封禁",
+    "私密账号",
+)
+_BROWSER_USER_UNAVAILABLE_SCRIPT = """(messages) => {
+    const visible = (element) => {
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' &&
+            style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+    };
+    const nodes = [...document.querySelectorAll('main *, [role="main"] *, body div, body p')]
+        .filter(element => !element.children.length && visible(element) &&
+            !element.closest('a, button, article, [data-e2e="user-info"], ' +
+                '[data-e2e="user-title"], [data-e2e="user-desc"], [data-e2e="user-signature"]'));
+    const texts = nodes.map(element => (element.innerText || '').trim());
+    // 必须同时出现权限提示；不能仅凭简介写着“私密账号”就跳过。
+    if (texts.includes('私密账号') &&
+        texts.includes('发起关注请求，通过后即可查看该账号内容')) return '私密账号';
+    // 昵称、简介和作品文案可能提到这些词，不能据此判定账号状态。
+    const profile = document.querySelector('[data-e2e="user-info"]');
+    if (profile && visible(profile)) return '';
+    return texts.find(text => text !== '私密账号' && messages.includes(text)) || '';
+}"""
 
 _HOMEPAGE_SCREENSHOT_BRIDGE_ENV = "DOUYIN_HOMEPAGE_SCREENSHOT_BRIDGE"
 _HOMEPAGE_SCREENSHOT_MESSAGE_PREFIX = "DOUYIN_HOMEPAGE_SCREENSHOT_REQUEST "
@@ -156,6 +189,16 @@ class LoginRequiredError(Exception):
         self.status_msg = status_msg
         self.path = path
         super().__init__(f"login required (status_code={status_code}) at {path}: {status_msg}")
+
+
+class UserUnavailableError(RuntimeError):
+    """浏览器主页明确显示账号不可用或当前无权查看作品。"""
+
+    def __init__(self, reason: str):
+        self.reason = (
+            "私密账号，当前登录账号无权查看作品" if reason == "私密账号" else reason
+        )
+        super().__init__(f"目标用户不可访问：{self.reason}")
 
 
 class FailedPayload(dict):
@@ -372,8 +415,12 @@ class DouyinAPIClient:
         cookies: Dict[str, str],
         proxy: Optional[str] = None,
         page_bridge: Optional[Any] = None,
+        browser_session: Optional[BrowserSession] = None,
     ):
         self.cookies = sanitize_cookies(cookies or {})
+        self.browser_session = browser_session
+        if browser_session is not None:
+            self.cookies = browser_session.cookies_for(self.cookies)
         self.proxy = str(proxy or "").strip()
         # 桌面版注入的页面签名通道(core/page_bridge.py,desktop-only)。为 None 时
         # 所有端点走 aiohttp——CLI 姊妹仓永远是 None。鸭子类型:只要求
@@ -382,8 +429,10 @@ class DouyinAPIClient:
         self.page_bridge = page_bridge
         self._session: Optional[aiohttp.ClientSession] = None
         self._browser_post_aweme_items: Dict[str, Dict[str, Any]] = {}
-        self._browser_post_stats: Dict[str, int] = {}
-        selected_ua = random.choice(_USER_AGENT_POOL)
+        self._browser_post_stats: Dict[str, Any] = {}
+        selected_ua = (browser_session.user_agent if browser_session is not None else None) or random.choice(_USER_AGENT_POOL)
+        if browser_session is not None:
+            browser_session.user_agent = selected_ua
         self.headers = {
             "User-Agent": selected_ua,
             "Referer": "https://www.douyin.com/?recommend=1",
@@ -960,7 +1009,16 @@ class DouyinAPIClient:
             }
         )
         raw = await self._request_json_gated("/aweme/v1/web/aweme/post/", params)
+        if (self.browser_session is not None and self.page_bridge is None
+                and isinstance(raw, FailedPayload) and raw.kind == FailedPayload.REJECTED
+                and not raw.via_bridge and _is_argus_rejection(raw.status, raw.detail)):
+            self.browser_session.post_api_requires_browser = True
         return self._normalize_post_page(raw, max_cursor=max_cursor)
+
+    @property
+    def prefer_browser_posts(self) -> bool:
+        return (self.browser_session is not None and self.page_bridge is None
+                and self.browser_session.post_api_requires_browser)
 
     @classmethod
     def _normalize_post_page(cls, raw: Any, *, max_cursor: int) -> Dict[str, Any]:
@@ -1793,6 +1851,7 @@ class DouyinAPIClient:
             target.parent.mkdir(parents=True, exist_ok=True)
             async with async_playwright() as playwright:
                 launch_options: Dict[str, Any] = {
+                    **await chromium_launch_options(playwright.chromium, headless=True),
                     "headless": True,
                     "args": [
                         "--disable-blink-features=AutomationControlled",
@@ -1919,14 +1978,9 @@ class DouyinAPIClient:
         max_scrolls: int = 240,
         idle_rounds: int = 8,
         wait_timeout_seconds: int = 600,
+        on_items=None,
     ) -> List[str]:
         browser_started = time.monotonic()
-        try:
-            from playwright.async_api import async_playwright
-        except Exception as exc:
-            logger.warning("Playwright not available, browser fallback disabled: %s", exc)
-            return []
-
         target_url = f"{self.BASE_URL}/user/{sec_uid}"
         timeout_ms = max(30, int(wait_timeout_seconds)) * 1000
         ids: List[str] = []
@@ -1935,6 +1989,11 @@ class DouyinAPIClient:
         post_api_seen: set[str] = set()
         post_api_aweme_items: Dict[str, Dict[str, Any]] = {}
         post_api_page_hits = 0
+        post_api_has_more = None
+        last_page_sequence = -1
+        stop_reason = "max_scrolls"
+        stream_limit_reached = False
+        deadline = browser_started + max(30, int(wait_timeout_seconds))
         self._browser_post_aweme_items = {}
         self._browser_post_stats = {}
 
@@ -1945,7 +2004,7 @@ class DouyinAPIClient:
                     ids.append(aweme_id)
 
         logger.warning(
-            "API翻页受限，启动浏览器兜底采集：target=%s expected_count=%s "
+            "通过浏览器采集作品列表：target=%s expected_count=%s "
             "headless=%s max_scrolls=%s idle_rounds=%s timeout_s=%s",
             safe_log_url(target_url),
             expected_count,
@@ -1955,51 +2014,30 @@ class DouyinAPIClient:
             wait_timeout_seconds,
         )
 
-        async with async_playwright() as playwright:
-            executable_path = str(getattr(playwright.chromium, "executable_path", "") or "")
-            logger.info(
-                "Browser fallback runtime: executable=%s exists=%s",
-                executable_path or "-",
-                bool(executable_path and os.path.exists(executable_path)),
-            )
-            browser = await playwright.chromium.launch(
-                headless=headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                    "--no-sandbox",
-                ],
-            )
-            context = await browser.new_context(
-                user_agent=self.headers.get("User-Agent", ""),
-                locale="zh-CN",
-                viewport={"width": 1600, "height": 900},
-            )
-            cookies = self._browser_cookie_payload()
-            logger.info(
-                "Browser fallback context ready: cookie_count=%s cookie_names=%s",
-                len(cookies),
-                ",".join(sorted(str(cookie.get("name")) for cookie in cookies)) or "-",
-            )
-            if cookies:
-                await context.add_cookies(cookies)
-
-            page = await context.new_page()
+        async with self._browser_page(headless=headless) as (context, page):
             pending_response_tasks: List[asyncio.Task] = []
 
-            async def _handle_response(response):
-                nonlocal post_api_page_hits
+            async def _handle_response(response, sequence):
+                nonlocal post_api_page_hits, post_api_has_more, last_page_sequence, stream_limit_reached
                 url = response.url or ""
                 if "/aweme/v1/web/aweme/post/" not in url:
+                    return
+                response_user = parse_qs(urlsplit(url).query).get("sec_user_id", [None])[0]
+                if response_user is not None and response_user != sec_uid:
                     return
                 try:
                     data = await response.json()
                 except Exception:
                     return
                 aweme_items = data.get("aweme_list") if isinstance(data, dict) else None
-                if isinstance(aweme_items, list):
+                if isinstance(aweme_items, list) and data.get("status_code", 0) == 0:
                     post_api_page_hits += 1
+                    if sequence >= last_page_sequence:
+                        last_page_sequence = sequence
+                        value = data.get("has_more")
+                        post_api_has_more = bool(value) if value in (0, 1) else None
                     extracted: List[str] = []
+                    fresh_items = []
                     for item in aweme_items:
                         if not isinstance(item, dict):
                             continue
@@ -2008,18 +2046,33 @@ class DouyinAPIClient:
                             continue
                         aweme_id_str = str(aweme_id)
                         extracted.append(aweme_id_str)
-                        if aweme_id_str not in post_api_aweme_items:
-                            post_api_aweme_items[aweme_id_str] = item
+                        if aweme_id_str not in post_api_seen:
+                            fresh_items.append(item)
+                            if on_items is None:
+                                post_api_aweme_items[aweme_id_str] = item
                     _merge(extracted)
                     for aweme_id in extracted:
                         if aweme_id not in post_api_seen:
                             post_api_seen.add(aweme_id)
                             post_api_ids.append(aweme_id)
+                    if on_items is not None and fresh_items:
+                        if await on_items(fresh_items) is False:
+                            stream_limit_reached = True
 
             def _on_response(response):
-                pending_response_tasks.append(asyncio.create_task(_handle_response(response)))
+                pending_response_tasks.append(asyncio.create_task(
+                    _handle_response(response, len(pending_response_tasks))))
 
             page.on("response", _on_response)
+
+            async def drain_responses():
+                nonlocal deadline
+                # Await page delivery before another scroll, so a full download queue
+                # pauses the list producer instead of accumulating callback tasks.
+                if on_items is not None and pending_response_tasks:
+                    started = time.monotonic()
+                    await asyncio.gather(*pending_response_tasks)
+                    deadline += time.monotonic() - started
 
             try:
                 try:
@@ -2029,6 +2082,10 @@ class DouyinAPIClient:
                         "Browser goto timeout or error, continue with current page state: %s",
                         exc,
                     )
+
+                if urlsplit(str(getattr(page, "url", target_url))).path != urlsplit(target_url).path:
+                    logger.warning("User page navigation did not reach the target; stale page ignored")
+                    return []
 
                 title = ""
                 try:
@@ -2067,7 +2124,9 @@ class DouyinAPIClient:
                         if page.is_closed():
                             logger.warning("Browser page closed during warmup")
                             break
+                        await self._check_browser_user_available(page)
                         _merge(await self._extract_aweme_ids_from_page(page))
+                        await drain_responses()
                         if ids:
                             break
                         await page.wait_for_timeout(1000)
@@ -2079,36 +2138,73 @@ class DouyinAPIClient:
                     for _ in range(max_scroll_rounds):
                         if page.is_closed():
                             logger.warning("Browser page closed during scrolling")
+                            stop_reason = "page_closed"
                             break
-                        await page.mouse.wheel(0, 3800)
-                        await page.wait_for_timeout(1200)
-
+                        if time.monotonic() >= deadline:
+                            stop_reason = "timeout"
+                            break
+                        if stream_limit_reached:
+                            stop_reason = "number_limit"
+                            break
+                        # Include responses arriving during scrolling/waiting in this round's growth.
                         before = len(ids)
+                        await self._scroll_user_post_page(page)
+                        await page.wait_for_timeout(1200)
+                        await drain_responses()
+
+                        if not ids:
+                            await self._check_browser_user_available(page)
                         _merge(await self._extract_aweme_ids_from_page(page))
                         if len(ids) == before:
                             stable_rounds += 1
                         else:
                             stable_rounds = 0
 
-                        if expected_count > 0 and len(ids) >= expected_count:
+                        if stream_limit_reached or (expected_count > 0 and len(ids) >= expected_count):
+                            stop_reason = "number_limit"
                             break
-                        if expected_count <= 0 and stable_rounds >= idle_stop_rounds:
+                        if post_api_has_more is False:
+                            stop_reason = "end_of_list"
                             break
+                        if stable_rounds >= idle_stop_rounds:
+                            stop_reason = "idle"
+                            break
+                except UserUnavailableError:
+                    raise
                 except Exception as exc:
+                    if on_items is not None:
+                        raise  # Storage/queue failures must reach the supervisor.
+                    stop_reason = "interrupted"
                     logger.warning(
                         "Browser collection interrupted, use collected ids so far: %s",
                         exc,
                     )
             finally:
+                remove_listener = getattr(page, "remove_listener", None)
+                if callable(remove_listener):
+                    remove_listener("response", _on_response)
                 if pending_response_tasks:
-                    await asyncio.gather(*pending_response_tasks, return_exceptions=True)
+                    try:
+                        if on_items is not None:
+                            # Delivery is part of the producer; keep backpressure and cancellation.
+                            if sys.exc_info()[0] is not None:
+                                for task in pending_response_tasks:
+                                    task.cancel()
+                                await asyncio.gather(*pending_response_tasks, return_exceptions=True)
+                            else:
+                                await asyncio.gather(*pending_response_tasks)
+                        else:
+                            await asyncio.wait_for(
+                                asyncio.gather(*pending_response_tasks, return_exceptions=True), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        logger.debug("Browser response tasks did not finish before cleanup")
                 try:
                     browser_cookies = await context.cookies(self.BASE_URL)
                     self._sync_browser_cookies(browser_cookies)
+                    if self.browser_session is not None:
+                        self.browser_session.remember_cookies(browser_cookies)
                 except Exception as exc:
                     logger.debug("Sync browser cookies skipped: %s", exc)
-                await context.close()
-                await browser.close()
 
         selected_ids: List[str] = []
         selected_seen: set[str] = set()
@@ -2123,28 +2219,75 @@ class DouyinAPIClient:
             "selected_ids": len(selected_ids),
             "post_items": len(post_api_aweme_items),
             "post_pages": post_api_page_hits,
+            "has_more": post_api_has_more,
+            "stop_reason": stop_reason,
+            "complete": stop_reason == "number_limit" or post_api_has_more is False,
         }
         logger.warning(
             "浏览器兜底采集 aweme_id: duration_ms=%s merged=%s from_post_api=%s "
-            "selected=%s post_items=%s post_pages=%s",
+            "selected=%s post_items=%s post_pages=%s stop_reason=%s has_more=%s",
             _elapsed_ms(browser_started),
             len(ids),
             len(post_api_ids),
             len(selected_ids),
             len(post_api_aweme_items),
             post_api_page_hits,
+            stop_reason,
+            post_api_has_more,
         )
         return selected_ids
+
+    @asynccontextmanager
+    async def _browser_page(self, *, headless):
+        session = self.browser_session if self.browser_session is not None else BrowserSession()
+        try:
+            async with session.page(
+                headless=headless, user_agent=self.headers.get("User-Agent", ""),
+                cookies=self._browser_cookie_payload(), proxy=self.proxy,
+            ) as page:
+                yield page
+        finally:
+            if self.browser_session is None:
+                await session.close()
+
+    async def _check_browser_user_available(self, page) -> None:
+        try:
+            reason = await page.evaluate(
+                _BROWSER_USER_UNAVAILABLE_SCRIPT, list(_UNAVAILABLE_USER_MESSAGES)
+            )
+        except Exception as exc:
+            logger.debug("Read user page availability skipped: %s", _safe_error_text(exc))
+            return
+        if reason in _UNAVAILABLE_USER_MESSAGES:
+            raise UserUnavailableError(reason)
 
     def pop_browser_post_aweme_items(self) -> Dict[str, Dict[str, Any]]:
         items = self._browser_post_aweme_items
         self._browser_post_aweme_items = {}
         return items
 
-    def pop_browser_post_stats(self) -> Dict[str, int]:
+    def pop_browser_post_stats(self) -> Dict[str, Any]:
         stats = self._browser_post_stats
         self._browser_post_stats = {}
         return stats
+
+    async def _scroll_user_post_page(self, page):
+        # Wheel events at the default mouse position may hit the sidebar instead of the list.
+        await page.evaluate("""() => {
+            const links = [...document.querySelectorAll('a[href*="/video/"], a[href*="/note/"]')];
+            const card = links.find(node => {
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            });
+            let target = card && card.parentElement;
+            while (target && target !== document.body) {
+                const style = getComputedStyle(target);
+                if (/(auto|scroll)/.test(style.overflowY) && target.scrollHeight > target.clientHeight + 1) break;
+                target = target.parentElement;
+            }
+            if (!target || target === document.body) target = document.scrollingElement;
+            if (target) target.scrollBy(0, Math.max(600, target.clientHeight * 0.85));
+        }""")
 
     def _browser_cookie_payload(self) -> List[Dict[str, str]]:
         payload: List[Dict[str, str]] = []

@@ -7,12 +7,13 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 import aiofiles
 
-from core.api_client import DouyinAPIClient
+from core.api_client import DouyinAPIClient, UserUnavailableError
 from core.downloader_base import BaseDownloader, DownloadResult
 from core.metadata import build_author_home_url
 from core.user_mode_registry import UserModeRegistry
 from core.user_modes.base_strategy import PageRequestFailedError
 from core.user_modes.mix_routing import collection_directories
+from utils.browser_runtime import BrowserUnavailableError
 from utils.logger import setup_logger
 
 logger = setup_logger("UserDownloader")
@@ -488,41 +489,9 @@ class UserDownloader(BaseDownloader):
         )
 
         async def _process_aweme(item: Dict[str, Any]):
-            aweme_id = item.get("aweme_id")
-            collection_dir = (
-                collection_directories(self).get(str(aweme_id)) if mode == "mix" else None
-            )
-            collection_options = {"collection_dir": collection_dir} if collection_dir else {}
-            if not await self._should_download(
-                str(aweme_id or ""),
-                force=force_download,
-                aweme=item,
-            ):
-                saved = await self._collect_comments_for_existing_aweme(
-                    item,
-                    author_name,
-                    mode,
-                    author_sec_uid=author_sec_uid,
-                    **collection_options,
-                )
-                status = "success" if saved else "skipped"
-                self._progress_advance_item(status, str(aweme_id or "unknown"))
-                return {"status": status, "aweme_id": aweme_id}
-
-            success = await self._download_aweme_assets(
-                item,
-                author_name,
-                mode=mode,
-                db_batch=db_batch,
-                author_sec_uid=author_sec_uid,
-                **collection_options,
-            )
-            status = "success" if success else "failed"
-            self._progress_advance_item(status, str(aweme_id or "unknown"))
-            return {
-                "status": status,
-                "aweme_id": aweme_id,
-            }
+            return await self._process_mode_aweme(
+                item, mode, author_name, author_sec_uid=author_sec_uid,
+                force_download=force_download, db_batch=db_batch)
 
         download_results = await self.queue_manager.download_batch(_process_aweme, deduped_items)
 
@@ -544,6 +513,23 @@ class UserDownloader(BaseDownloader):
 
         return result
 
+    async def _process_mode_aweme(self, item, mode, author_name, *, author_sec_uid=None,
+                                  force_download=False, db_batch=None):
+        aweme_id = str(item.get("aweme_id") or "")
+        collection_dir = collection_directories(self).get(aweme_id) if mode == "mix" else None
+        options = {"collection_dir": collection_dir} if collection_dir else {}
+        if not await self._should_download(aweme_id, force=force_download, aweme=item):
+            saved = await self._collect_comments_for_existing_aweme(
+                item, author_name, mode, author_sec_uid=author_sec_uid, **options)
+            status = "success" if saved else "skipped"
+        else:
+            success = await self._download_aweme_assets(
+                item, author_name, mode=mode, db_batch=db_batch,
+                author_sec_uid=author_sec_uid, **options)
+            status = "success" if success else "failed"
+        self._progress_advance_item(status, aweme_id or "unknown")
+        return {"status": status, "aweme_id": aweme_id}
+
     # 向后兼容：旧测试仍直接调用 post 下载入口。
     async def _download_user_post(self, sec_uid: str, user_info: Dict[str, Any]) -> DownloadResult:
         strategy = self._get_mode_strategy("post")
@@ -558,7 +544,9 @@ class UserDownloader(BaseDownloader):
         aweme_list: List[Dict[str, Any]],
         *,
         item_filter: Optional[Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
+        on_items=None,
     ) -> None:
+        self._browser_post_incomplete_reason = None
         unavailable_reason = self._browser_recovery_unavailable_reason()
         if unavailable_reason:
             self._progress_update_step("拉取作品列表", f"浏览器回补不可用（{unavailable_reason}）")
@@ -569,8 +557,8 @@ class UserDownloader(BaseDownloader):
         number_limit = self.config.get("number", {}).get("post", 0)
         # 在分页受限场景下，user_info.aweme_count 常常不可靠（经常只返回 20）
         # 媒体筛选需要先拿到详情才能判断，不能用原始 ID 数提前截断。
-        expected_count = 0 if item_filter else int(number_limit or 0)
-        if self._post_recovery_limit_reached(aweme_list, number_limit, item_filter):
+        expected_count = 0 if item_filter or on_items is not None else int(number_limit or 0)
+        if on_items is None and self._post_recovery_limit_reached(aweme_list, number_limit, item_filter):
             logger.info(
                 "Browser fallback skipped: number limit reached existing=%s limit=%s",
                 len(aweme_list),
@@ -589,7 +577,26 @@ class UserDownloader(BaseDownloader):
             int(browser_cfg.get("idle_rounds", 8) or 8),
             int(browser_cfg.get("wait_timeout_seconds", 600) or 600),
         )
+        stream_seen = {str(item.get("aweme_id")) for item in aweme_list}
+
+        async def deliver(items):
+            fresh = []
+            for item in items:
+                key = str(item.get("aweme_id") or "")
+                author = item.get("author") or {}
+                if not key or key in stream_seen or (
+                        author.get("sec_uid") and str(author["sec_uid"]) != str(sec_uid)):
+                    continue
+                stream_seen.add(key)
+                fresh.append(item)
+            if not fresh:
+                return True
+            keep_going = await on_items(fresh)
+            aweme_list.extend({"aweme_id": str(item["aweme_id"])} for item in fresh)
+            return keep_going
+
         try:
+            stream_options = {"on_items": deliver} if on_items is not None else {}
             browser_aweme_ids = await self.api_client.collect_user_post_ids_via_browser(
                 sec_uid,
                 expected_count=expected_count,
@@ -597,8 +604,13 @@ class UserDownloader(BaseDownloader):
                 max_scrolls=int(browser_cfg.get("max_scrolls", 240) or 240),
                 idle_rounds=int(browser_cfg.get("idle_rounds", 8) or 8),
                 wait_timeout_seconds=int(browser_cfg.get("wait_timeout_seconds", 600) or 600),
+                **stream_options,
             )
+        except (UserUnavailableError, BrowserUnavailableError):
+            raise
         except Exception:
+            if on_items is not None:
+                raise
             logger.exception(
                 "Browser fallback failed: duration_ms=%s",
                 int((time.monotonic() - fallback_started) * 1000),
@@ -606,7 +618,7 @@ class UserDownloader(BaseDownloader):
             return
 
         browser_aweme_items: Dict[str, Dict[str, Any]] = {}
-        browser_post_stats: Dict[str, int] = {}
+        browser_post_stats: Dict[str, Any] = {}
         if hasattr(self.api_client, "pop_browser_post_aweme_items"):
             try:
                 browser_aweme_items = self.api_client.pop_browser_post_aweme_items() or {}
@@ -617,6 +629,18 @@ class UserDownloader(BaseDownloader):
                 browser_post_stats = self.api_client.pop_browser_post_stats() or {}
             except Exception as exc:
                 logger.debug("Fetch browser post stats skipped: %s", exc)
+
+        if browser_post_stats.get("complete") is False:
+            reasons = {"idle": "页面连续滚动未再加载新作品，但未收到分页结束确认",
+                       "max_scrolls": "已达到浏览器滚动次数上限",
+                       "timeout": "已达到浏览器采集时间上限",
+                       "page_closed": "浏览器页面已关闭",
+                       "interrupted": "浏览器采集发生异常"}
+            reason = reasons.get(browser_post_stats.get("stop_reason"), "浏览器未确认作品列表结束")
+            self._browser_post_incomplete_reason = "作品列表可能未取全：" + reason
+
+        if on_items is not None and browser_post_stats.get("stop_reason") == "number_limit":
+            return
 
         if not browser_aweme_ids:
             logger.warning(
@@ -647,7 +671,7 @@ class UserDownloader(BaseDownloader):
         reused_from_browser_items = 0
         total_missing = len(missing_ids)
         for index, aweme_id in enumerate(missing_ids, start=1):
-            if self._post_recovery_limit_reached(aweme_list, number_limit, item_filter):
+            if on_items is None and self._post_recovery_limit_reached(aweme_list, number_limit, item_filter):
                 break
 
             if index == 1 or index == total_missing or index % 5 == 0:
@@ -682,7 +706,11 @@ class UserDownloader(BaseDownloader):
                     detail_sec_uid,
                 )
                 continue
-            aweme_list.append(detail)
+            if on_items is not None:
+                if await deliver([detail]) is False:
+                    break
+            else:
+                aweme_list.append(detail)
 
         self._progress_update_step(
             "浏览器回补",
@@ -701,6 +729,9 @@ class UserDownloader(BaseDownloader):
             detail_failed,
         )
         if detail_failed > 0:
+            detail_reason = "{}条作品详情未能获取".format(detail_failed)
+            self._browser_post_incomplete_reason = "；".join(filter(None, [
+                self._browser_post_incomplete_reason, detail_reason]))
             logger.warning(
                 "Browser fallback detail fetch failed: %s/%s",
                 detail_failed,

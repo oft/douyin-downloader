@@ -915,8 +915,12 @@ class BaseDownloader(ABC):
 
         if self.config.get("avatar"):
             author = aweme_data.get("author", {})
-            avatar_source = author.get("avatar_larger")
-            if self._extract_urls(avatar_source):
+            # 浏览器作品列表常只带 avatar_thumb；优先高清，缺失或镜像失败时降级。
+            avatar_urls = []
+            for field in ("avatar_larger", "avatar_medium", "avatar_thumb"):
+                avatar_urls.extend(self._extract_urls(author.get(field)))
+            avatar_source = {"url_list": list(dict.fromkeys(avatar_urls))}
+            if avatar_urls:
                 avatar_path = save_dir / f"{file_stem}_avatar.jpg"
                 optional_assets.append(
                     (

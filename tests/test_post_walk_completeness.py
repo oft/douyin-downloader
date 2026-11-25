@@ -6,10 +6,12 @@
 
 import asyncio
 from typing import Any, Dict, List, Optional
+from unittest.mock import AsyncMock
 
 import pytest
 
 from core.api_client import DouyinAPIClient, FailedPayload
+from core.browser_session import BrowserSession
 from core.user_modes import post_strategy as post_strategy_module
 from core.user_modes.base_strategy import PageRequestFailedError
 from core.user_modes.post_strategy import PostUserModeStrategy
@@ -489,6 +491,108 @@ def test_direct_argus_rejection_on_post_says_retry_and_relogin_are_useless(monke
 
     assert api.calls == [0]
     assert "重试或重新登录都无效" in str(info.value)
+
+
+def _batch_api(session, payload):
+    api = DouyinAPIClient({"msToken": "test-token"}, browser_session=session)
+    api._build_user_page_params = AsyncMock(return_value={})
+    api._request_json_gated = AsyncMock(return_value=payload)
+    return api
+
+
+def _direct_gate():
+    return FailedPayload(
+        FailedPayload.REJECTED, status=403,
+        detail="Blocked by ArgusSecurityPlugin Uifid Not Found",
+    )
+
+
+def test_confirmed_gate_routes_next_author_through_browser_without_another_api_call():
+    session = BrowserSession()
+    first_api = _batch_api(session, _direct_gate())
+    first = _FakeDownloader(first_api, recovered_items=[_make_aweme("first")])
+    assert [item["aweme_id"] for item in _run_collect(PostUserModeStrategy(first))] == ["first"]
+    first_api._request_json_gated.assert_awaited_once()
+    assert session.post_api_requires_browser is True
+
+    second_api = _batch_api(session, {})
+    second = _FakeDownloader(second_api, recovered_items=[_make_aweme("second")])
+    assert [item["aweme_id"] for item in _run_collect(PostUserModeStrategy(second))] == ["second"]
+    second_api._request_json_gated.assert_not_awaited()
+    assert first.recover_calls == second.recover_calls == 1
+    assert "正在通过浏览器获取作品列表" in second.details()
+    assert "分页受限" not in second.details()
+    third_api = _batch_api(BrowserSession(), {
+        "status_code": 0, "aweme_list": [_make_aweme("third")], "has_more": 0, "max_cursor": 0,
+    })
+    third = _FakeDownloader(third_api)
+    assert [item["aweme_id"] for item in _run_collect(PostUserModeStrategy(third))] == ["third"]
+    third_api._request_json_gated.assert_awaited_once()
+    assert third.recover_calls == 0
+
+
+@pytest.mark.parametrize("payload", [
+    {}, {"status_code": 0},
+    FailedPayload(FailedPayload.REJECTED, status=403, detail="Forbidden"),
+    FailedPayload(FailedPayload.REJECTED, status=429, detail="ArgusSecurityPlugin"),
+    FailedPayload(FailedPayload.REJECTED, status=403, detail="ArgusSecurityPlugin", via_bridge=True),
+    FailedPayload(FailedPayload.BRIDGE_ERROR, detail="TIMEOUT"),
+])
+def test_transient_or_uncertain_failure_does_not_enable_batch_browser_preference(payload):
+    session = BrowserSession()
+    api = _batch_api(session, payload)
+    asyncio.run(api.get_user_post("first"))
+    assert api.prefer_browser_posts is False
+    assert _batch_api(session, {}).prefer_browser_posts is False
+
+
+def test_timeout_does_not_enable_batch_browser_preference():
+    session = BrowserSession()
+    api = _batch_api(session, {})
+    api._request_json_gated.side_effect = asyncio.TimeoutError()
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(api.get_user_post("first"))
+    assert session.post_api_requires_browser is False
+
+
+@pytest.mark.parametrize("bridge", [False, True])
+def test_cached_gate_respects_disabled_browser_and_page_bridge(bridge):
+    session = BrowserSession()
+    session.post_api_requires_browser = True
+    api = _batch_api(session, {
+        "status_code": 0, "aweme_list": [_make_aweme("api-work")], "has_more": 0, "max_cursor": 0,
+    })
+    if bridge:
+        api.page_bridge = object()
+    downloader = _FakeDownloader(api, browser_reason=None if bridge else "已关闭浏览器回补")
+    items = _run_collect(PostUserModeStrategy(downloader))
+    assert [item["aweme_id"] for item in items] == ["api-work"]
+    api._request_json_gated.assert_awaited_once()
+    assert downloader.recover_calls == 0
+
+
+def test_empty_direct_browser_result_reports_browser_failure_without_stale_api_error():
+    session = BrowserSession()
+    session.post_api_requires_browser = True
+    api = _batch_api(session, {})
+    strategy = PostUserModeStrategy(_FakeDownloader(api))
+    strategy._failure_message = "旧的安全校验错误"
+    strategy._hard_truncation = "旧的不完整原因"
+    strategy.incomplete_reason = "旧的不完整原因"
+    with pytest.raises(PageRequestFailedError, match="浏览器未获取到作品列表") as info:
+        _run_collect(strategy)
+    api._request_json_gated.assert_not_awaited()
+    assert "旧的" not in str(info.value)
+    assert strategy.incomplete_reason is None
+    assert strategy._hard_truncation is None
+
+
+def test_first_gated_author_with_empty_browser_result_reports_browser_outcome():
+    api = _batch_api(BrowserSession(), _direct_gate())
+    with pytest.raises(PageRequestFailedError, match="浏览器未获取到作品列表") as info:
+        _run_collect(PostUserModeStrategy(_FakeDownloader(api)))
+    api._request_json_gated.assert_awaited_once()
+    assert "当前运行方式不支持" not in str(info.value)
 
 
 def test_rejected_later_page_keeps_items_and_names_the_rejection(monkeypatch):

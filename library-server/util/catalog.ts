@@ -4,6 +4,7 @@ import { readdir, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { readWorks, resolveMediaPath } from './db.ts';
 import type { WorkRow } from './db.ts';
+import { readRowsInWorker } from './catalog-reader.ts';
 
 const text = (value: unknown) => typeof value === 'string' ? value.trim() : '';
 const collator = new Intl.Collator('zh-CN', { numeric: true });
@@ -215,8 +216,9 @@ async function inspect(root: string, candidate: Candidate, assets: Map<string, A
     return { ...describeWork(row, stem), kind, copy, owner: candidate.owner };
 }
 
-export function scanCatalog(downloadRoot: string, databaseFile: string): Promise<Catalog> {
-    return realpath(downloadRoot).then(root => inspectCatalogRows(root, readWorks(databaseFile)));
+export async function scanCatalog(downloadRoot: string, databaseFile: string): Promise<Catalog> {
+    const [root, rows] = await Promise.all([realpath(downloadRoot), readRowsInWorker(databaseFile)]);
+    return inspectCatalogRows(root, rows);
 }
 
 export function readDatabaseCatalog(root: string, databaseFile: string): DatabaseCatalog {

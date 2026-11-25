@@ -552,4 +552,97 @@ test('database catalog, media routes, refresh, and confirmed deletion', async t 
         assert.equal(await readFile(path.join(root, '其他作者', 'post', 'other-work', 'other-work.mp4'), 'utf8'), 'keep-other-author');
         assert.equal(await readFile(path.join(root, '第三作者', 'post', '不同作者丙', '不同作者丙.mp4'), 'utf8'), '不同作者丙');
     });
+
+    await t.test('clearing an author preserves links and records while resetting files and queue states', async () => {
+        const first = '7488888888888888881';
+        const second = '7488888888888888882';
+        const missing = '7488888888888888883';
+        const pending = '7488888888888888884';
+        const orphan = '7488888888888888885';
+        const late = '7488888888888888886';
+        const flat = path.join(root, '清除测试作者', 'post');
+        await mkdir(flat, { recursive: true });
+        const firstFile = path.join(flat, `${first}_video.mp4`);
+        const secondDir = path.join(flat, second);
+        const secondFile = path.join(secondDir, `${second}_video.mp4`);
+        const retained = path.join(flat, 'author-home-url.txt');
+        await writeFile(firstFile, 'clear-first');
+        await writeFile(retained, 'keep-author-profile');
+        await mkdir(secondDir, { recursive: true });
+        await writeFile(secondFile, 'clear-second');
+        const seed = new DatabaseSync(databaseFile);
+        try {
+            const columns = new Set((seed.prepare('PRAGMA table_info(aweme)').all() as { name: string }[]).map(row => row.name));
+            for (const column of ['download_time INTEGER', 'metadata_path TEXT', 'cover_path TEXT', 'avatar_path TEXT']) {
+                if (!columns.has(column.split(' ')[0]!)) seed.exec(`ALTER TABLE aweme ADD COLUMN ${column}`);
+            }
+            seed.exec(`CREATE TABLE download_queue (scope TEXT, aweme_id TEXT, payload TEXT,
+                status TEXT, created_us INTEGER, updated_us INTEGER, PRIMARY KEY(scope,aweme_id))`);
+            const insert = seed.prepare(`INSERT INTO aweme
+                (aweme_id,aweme_type,title,author_id,author_name,author_sec_uid,create_time,file_path,metadata,download_time,metadata_path,cover_path,avatar_path)
+                VALUES (?,'video',?,'uid-clear','清除测试作者','sec-clear',1793520000,?,'{"preserved":true}',123,'old.json','old-cover.jpg','old-avatar.jpg')`);
+            insert.run(first, '平铺作品', firstFile);
+            insert.run(second, '独立作品', secondFile);
+            insert.run(missing, '已丢失作品', path.join(flat, 'missing.mp4'));
+            insert.run(pending, '待下载作品', null);
+            const queue = seed.prepare('INSERT INTO download_queue VALUES (?,?,?,?,1,1)');
+            for (const id of [first, second, missing, pending, orphan]) queue.run('post:sec-clear:scope', id, '{}', 'completed');
+            queue.run('post:sec-third:scope', '7477777777777777773', '{"keep":true}', 'completed');
+        } finally { seed.close(); }
+        const config = JSON.parse(await readFile(configFile, 'utf8'));
+        config.link.push('https://www.douyin.com/user/sec-clear', 'https://www.douyin.com/user/sec-clear/?from=share');
+        await writeFile(configFile, JSON.stringify(config, null, 2));
+        const originalConfig = await readFile(configFile, 'utf8');
+        const authors = await (await app.request('http://localhost/api/catalog/authors')).json() as { items: { id: string; name: string }[] };
+        const author = authors.items.find(item => item.name === '清除测试作者')!;
+        const base = 'http://localhost/api/catalog/authors/' + author.id;
+        const endpoint = base + '/works/clear';
+        const preview = async () => await (await app.request(endpoint + '?page=2&size=1&q=no-match')).json() as {
+            token: string; workCount: number; resetWorks: number; removedLinks: number; errors: string[];
+        };
+        const remove = (token?: string, origin = 'http://localhost', url = endpoint) => app.request(url, {
+            method: 'DELETE', headers: { Origin: origin, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: 'permanent', token }),
+        });
+        const plan = await preview();
+        assert.deepEqual(plan.errors, []);
+        assert.equal(plan.workCount, 3); // Includes missing files, independently of page/search filters.
+        assert.equal(plan.resetWorks, 5); // Also includes undownloaded and orphaned queue entries.
+        assert.equal(plan.removedLinks, 0);
+        assert.equal((await remove()).status, 400);
+        assert.equal((await remove(plan.token, 'https://example.com')).status, 403);
+        assert.equal((await app.request(endpoint, { method: 'DELETE' })).status, 415);
+        const authorPlan = await (await app.request(base + '/removal')).json() as { token: string };
+        assert.equal((await remove(authorPlan.token)).status, 409);
+        assert.equal((await remove(plan.token, 'http://localhost', base)).status, 409);
+        const changed = new DatabaseSync(databaseFile);
+        changed.prepare(`INSERT INTO aweme (aweme_id,aweme_type,author_sec_uid) VALUES (?,'video','sec-clear')`).run(late);
+        changed.close();
+        assert.equal((await remove(plan.token)).status, 409); // A newly discovered DB record changes confirmation scope.
+        assert.equal(await readFile(firstFile, 'utf8'), 'clear-first');
+        const fresh = await preview();
+        const response = await remove(fresh.token);
+        assert.equal(response.status, 200, await response.clone().text());
+        const result = await response.json() as { resetWorks: number; removedLinks: number };
+        assert.equal(result.resetWorks, 6);
+        assert.equal(result.removedLinks, 0);
+        assert.equal(await readFile(configFile, 'utf8'), originalConfig);
+        await assert.rejects(stat(firstFile));
+        await assert.rejects(stat(secondDir));
+        assert.equal(await readFile(retained, 'utf8'), 'keep-author-profile');
+        assert.equal(await readFile(path.join(root, '第三作者', 'post', '不同作者丙', '不同作者丙.mp4'), 'utf8'), '不同作者丙');
+        const check = new DatabaseSync(databaseFile);
+        try {
+            const rows = check.prepare('SELECT file_path,download_time,metadata_path,cover_path,avatar_path,metadata FROM aweme WHERE author_sec_uid=?').all('sec-clear');
+            assert.equal(rows.length, 5); // Original rows retained; orphan only has a queue record.
+            for (const row of rows) for (const key of ['file_path', 'download_time', 'metadata_path', 'cover_path', 'avatar_path']) assert.equal(row[key], null);
+            assert.equal(rows.filter(row => row.metadata === '{"preserved":true}').length, 4);
+            for (const row of check.prepare('SELECT aweme_id,status,payload FROM download_queue WHERE scope=?').all('post:sec-clear:scope')) {
+                assert.equal(row.status, 'pending');
+                assert.equal(JSON.parse(String(row.payload)).aweme_id, row.aweme_id);
+            }
+            assert.equal(check.prepare('SELECT status FROM download_queue WHERE scope=?').get('post:sec-third:scope')?.status, 'completed');
+            assert.ok(check.prepare('SELECT file_path FROM aweme WHERE aweme_id=?').get('7477777777777777773')?.file_path);
+        } finally { check.close(); }
+    });
 });

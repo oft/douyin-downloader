@@ -815,6 +815,41 @@ async def test_download_aweme_assets_video_writes_cover_avatar_and_json(tmp_path
     await api_client.close()
 
 
+@pytest.mark.parametrize("author, expected", [
+    ({"avatar_thumb": {"url_list": ["https://example.com/thumb.jpg"]}}, ["thumb"]),
+    ({"avatar_larger": None, "avatar_medium": {"url_list": ["https://example.com/medium.jpg"]},
+      "avatar_thumb": {"url_list": ["https://example.com/thumb.jpg"]}}, ["medium"]),
+    ({"avatar_larger": {"url_list": ["https://example.com/large.jpg"]},
+      "avatar_medium": {"url_list": ["https://example.com/large.jpg", "https://example.com/medium.jpg"]},
+      "avatar_thumb": {"url_list": ["https://example.com/thumb.jpg"]}}, ["large", "medium", "thumb"]),
+])
+@pytest.mark.asyncio
+async def test_avatar_download_supports_browser_thumbnail_and_quality_fallback(tmp_path, monkeypatch, author, expected):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(video=False, cover=False, music=False, avatar=True, json=False)
+    monkeypatch.setattr(api_client, "get_session", AsyncMock(return_value=object()))
+    attempted = []
+
+    async def download(url, save_path, _session, **_kwargs):
+        kind = url.rsplit("/", 1)[-1].split(".")[0]
+        attempted.append(kind)
+        if kind != expected[-1]:
+            return False
+        save_path.write_bytes(b"avatar fixture")
+        return True
+
+    monkeypatch.setattr(downloader, "_download_with_retry", download)
+    data = {"aweme_id": "7600224486650121527", "desc": "头像回归", "aweme_type": 0,
+            "author": {"nickname": "作者", **author},
+            "video": {"play_addr": {"url_list": ["https://example.com/video.mp4"]}}}
+    assert await downloader._download_aweme_assets(data, author_name="作者", mode="post") is True
+    assert attempted == expected
+    avatars = list(tmp_path.rglob("*_avatar.jpg"))
+    assert len(avatars) == 1 and avatars[0].read_bytes() == b"avatar fixture"
+    assert not list(tmp_path.rglob("*.mp4"))
+    await api_client.close()
+
+
 @pytest.mark.asyncio
 async def test_video_false_skips_mp4_but_keeps_selected_sidecars(tmp_path, monkeypatch):
     downloader, api_client = _build_downloader(tmp_path)

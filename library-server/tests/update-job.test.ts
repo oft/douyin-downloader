@@ -58,6 +58,32 @@ test('reports completion, login failure and missing dependencies', async () => {
     }
 });
 
+test('reads fragmented progress without blocking status and retains the final snapshot', async () => {
+    const snapshot = {
+        totalUrls: 2, completedUrls: 1, currentIndex: 2, failedUrls: 0,
+        url: 'https://www.douyin.com/user/test', author: '测试作者', step: '下载作品', detail: '',
+        itemsTotal: 3, itemsCompleted: 1, success: 1, failed: 0, skipped: 0,
+        bytesRead: 0, bytesTotal: 0, currentItem: '', message: '',
+    };
+    const line = JSON.stringify({ type: 'progress', version: 1, progress: snapshot });
+    const child = `
+        const bytes = Buffer.from(${JSON.stringify(line)});
+        const split = bytes.indexOf(Buffer.from('测试')) + 1;
+        process.stdout.write('ordinary log\\n');
+        process.stdout.write(bytes.subarray(0, split));
+        setTimeout(() => process.stdout.write(bytes.subarray(split)), 20);
+    `;
+    const job = new UpdateJob(process.execPath, ['-e', child], process.cwd());
+    job.start();
+    await waitFor(() => !job.active);
+    assert.equal(job.status.state, 'completed');
+    assert.equal(job.status.progress?.author, '测试作者');
+    assert.equal(job.status.progress?.completedUrls, 1);
+    assert.ok(job.status.progress?.updatedAt);
+    assert.equal(job.start().progress, undefined);
+    await waitFor(() => !job.active);
+});
+
 test('update routes validate local requests and expose start failures', async t => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'dy-library-update-'));
     t.after(() => rm(root, { recursive: true, force: true }));

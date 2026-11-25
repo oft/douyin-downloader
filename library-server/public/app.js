@@ -1,4 +1,6 @@
 import { profileIdFromLink } from './profile-link.js';
+import { updateProgressView } from './update-progress.js';
+import { linkCheckNames, linkCheckResult } from './link-check.js';
 
 const byId = id => document.getElementById(id);
 const modal = byId('modal');
@@ -46,6 +48,14 @@ let linkQuery = '';
 let savingLinks = false;
 let updateTimer;
 let updateVersion = 0;
+let linkCheck = { state: 'idle', total: 0, completed: 0, results: [] };
+const linkCheckResults = new Map();
+let linkCheckFilter = '';
+let linkCheckTimer;
+let linkCheckVersion = 0;
+let linkCheckBusy = false;
+let showCheckBrowser = false;
+const checkActive = () => ['starting', 'running', 'stopping'].includes(linkCheck.state);
 
 function escape(value = '') {
     const replacements = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
@@ -241,6 +251,7 @@ async function loadList({ showLoading = false, workPage } = {}) {
             byId('heading').textContent = author.name;
             const issueAction = author.issueCount ? `<a class="secondary" href="${issueLink('author', author.id)}">查看作者异常</a>` : '';
             byId('header-action').innerHTML = `${issueAction}<button class="secondary" type="button" data-remove-author-links="${escape(author.id)}">删除链接</button>
+                <button class="secondary danger" type="button" data-clear-author-works="${escape(author.id)}">清除所有作品</button>
                 <button class="secondary danger" type="button" data-remove-author="${escape(author.id)}">删除作者</button>${selectionActions()}`;
         }
         let summary = `共 ${number.format(data.total)} ${endpoint === 'authors' ? '位作者' : endpoint === 'issues' ? '条异常记录' : '件作品'}`;
@@ -288,17 +299,25 @@ function updateLinkControls() {
     byId('link-changes').textContent = linksChanged() ? '有未保存的更改' : '';
     byId('save-links').disabled = savingLinks || !linksChanged();
     byId('save-links').textContent = savingLinks ? '保存中…' : '保存配置';
+    byId('check-all-links').disabled = savingLinks || linkCheckBusy || checkActive() || !linkDraft.length;
+    byId('stop-link-check').hidden = !checkActive();
+    byId('stop-link-check').disabled = linkCheckBusy || linkCheck.state === 'stopping';
+    byId('show-check-browser').disabled = linkCheckBusy || checkActive();
+    results.querySelectorAll('[data-check-link]').forEach(button => {
+        button.disabled = savingLinks || linkCheckBusy || checkActive() || !linkDraft[Number(button.dataset.checkLink)]?.trim();
+    });
 }
 
 function filterLinks() {
     const query = linkQuery.trim().toLowerCase();
     let visible = 0;
     results.querySelectorAll('.link-row').forEach((row, index) => {
-        row.hidden = !linkDraft[index].toLowerCase().includes(query);
+        const state = linkCheckResults.get(linkDraft[index])?.status ?? 'unchecked';
+        row.hidden = !linkDraft[index].toLowerCase().includes(query) || Boolean(linkCheckFilter && state !== linkCheckFilter);
         if (!row.hidden) visible++;
     });
-    byId('link-no-matches').hidden = !query || visible > 0 || !linkDraft.length;
-    byId('summary').textContent = query ? `显示 ${number.format(visible)} / ${number.format(linkDraft.length)} 条下载链接`
+    byId('link-no-matches').hidden = !(query || linkCheckFilter) || visible > 0 || !linkDraft.length;
+    byId('summary').textContent = query || linkCheckFilter ? `显示 ${number.format(visible)} / ${number.format(linkDraft.length)} 条下载链接`
         : `共 ${number.format(linkDraft.length)} 条下载链接`;
 }
 
@@ -320,18 +339,37 @@ function renderLinks(focusIndex) {
                 <div class="form-actions"><button class="secondary" id="reload-links" type="button">重新读取</button>
                 <button class="primary" id="save-links" type="submit">保存配置</button></div></div>
             <div class="summary link-changes" id="link-changes" role="status"></div>
+            <div class="link-check-toolbar">
+                <button class="secondary" id="check-all-links" type="button">检测全部</button>
+                <button class="secondary danger" id="stop-link-check" type="button" hidden>停止检测</button>
+                <label><input id="show-check-browser" type="checkbox">显示检测浏览器</label>
+                <label>检测结果 <select id="link-check-filter" aria-label="按检测结果筛选">
+                    ${options({ '': '全部状态', ...linkCheckNames, unchecked: '未检测' }, linkCheckFilter)}
+                </select></label>
+            </div>
+            <p class="summary">检测当前编辑列表，不保存配置、不下载作品。重复链接只检测一次，无法确认的结果不会标为失效。</p>
+            <p class="summary" id="link-check-summary" role="status"></p>
+            <progress class="link-check-progress" id="link-check-progress" max="1" value="0" aria-label="链接检测进度" hidden></progress>
+            <p class="player-error" id="link-check-error" role="alert" hidden></p>
             <p class="player-error" id="link-save-error" role="alert" hidden></p>
         </div>
         <fieldset id="link-fields" class="link-fields" aria-label="下载链接">
             ${linkDraft.length ? `<ol class="link-list">${linkDraft.map((_, index) => `<li class="link-row">
-                <label>链接 ${index + 1}<textarea name="link" data-link-index="${index}" rows="2" spellcheck="false" required></textarea></label>
+                <div class="link-main"><label>链接 ${index + 1}<textarea name="link" data-link-index="${index}" rows="2" spellcheck="false" required></textarea></label>
+                    <p class="link-check-result" data-link-result="${index}">未检测</p></div>
                 <div class="link-row-actions"><a class="secondary" data-link-author="${index}" hidden>作者页</a>
+                <button class="secondary" type="button" data-check-link="${index}">检测</button>
                 <button class="secondary danger" type="button" data-remove-link="${index}" aria-label="移除链接 ${index + 1}">移除</button></div>
             </li>`).join('')}</ol>` : box('暂无下载链接', '点击「添加链接」填写下载地址。')}
         </fieldset>
         <div class="empty" id="link-no-matches" hidden><p>没有符合搜索条件的链接。</p></div>
     </form>`;
     const form = byId('link-form');
+    byId('show-check-browser').checked = showCheckBrowser;
+    byId('show-check-browser').addEventListener('change', event => { showCheckBrowser = event.target.checked; });
+    byId('link-check-filter').addEventListener('change', event => { linkCheckFilter = event.target.value; filterLinks(); });
+    byId('check-all-links').addEventListener('click', () => void refreshLinkCheck('start', [...linkDraft]));
+    byId('stop-link-check').addEventListener('click', () => void refreshLinkCheck('stop'));
     const search = byId('link-search');
     search.value = linkQuery;
     search.addEventListener('keydown', event => { if (event.key === 'Enter') event.preventDefault(); });
@@ -344,11 +382,12 @@ function renderLinks(focusIndex) {
             filterLinks();
             return;
         }
+        if (input.dataset.linkIndex === undefined) return;
         input.setCustomValidity('');
         const index = Number(input.dataset.linkIndex);
         linkDraft[index] = input.value;
         updateLinkAuthor(index);
-        updateLinkControls();
+        renderLinkCheck();
     });
     form.addEventListener('submit', saveLinks);
     byId('add-link').addEventListener('click', () => {
@@ -361,10 +400,66 @@ function renderLinks(focusIndex) {
     });
     filterLinks();
     updateLinkControls();
+    renderLinkCheck();
+    void refreshLinkCheck();
     results.setAttribute('aria-busy', 'false');
     if (focusIndex !== undefined) {
         const focus = inputs[focusIndex];
         (focus && !focus.closest('[hidden]') ? focus : inputs.length ? byId('link-search') : byId('add-link')).focus();
+    }
+}
+
+function renderLinkCheck() {
+    if (!byId('link-form')) return;
+    results.querySelectorAll('[data-link-result]').forEach(node => {
+        const link = linkDraft[Number(node.dataset.linkResult)];
+        const checked = linkCheckResult(link, linkCheck, linkCheckResults);
+        if (node.dataset.status !== checked.status) node.dataset.status = checked.status;
+        const text = checked.checkedAt
+            ? `${checked.name} · ${checked.reason} · ${date.format(new Date(checked.checkedAt))}` : checked.name;
+        if (node.textContent !== text) node.textContent = text;
+    });
+    const labels = { ...updateStates, running: '检测中', failed: '检测中断', completed: '检测结束' };
+    byId('link-check-summary').textContent = linkCheck.state === 'idle' ? '尚未开始检测'
+        : `${labels[linkCheck.state]} · 已检测 ${linkCheck.completed} / ${linkCheck.total} 条链接（去重后）`;
+    const bar = byId('link-check-progress');
+    bar.hidden = !linkCheck.total;
+    bar.max = linkCheck.total || 1;
+    bar.value = linkCheck.completed;
+    const error = byId('link-check-error');
+    error.textContent = linkCheck.error || '';
+    error.hidden = !error.textContent;
+    updateLinkControls();
+    filterLinks();
+}
+
+async function refreshLinkCheck(action, links) {
+    if (action === 'start' && (!links?.length || links.some(link => !link.trim()))) {
+        showToast('请先填写或移除空白链接', true); return;
+    }
+    clearTimeout(linkCheckTimer);
+    const version = ++linkCheckVersion;
+    const current = () => version === linkCheckVersion && route.view === 'links' && byId('link-form');
+    if (action) { linkCheckBusy = true; updateLinkControls(); }
+    try {
+        const next = action ? await api(`link-check/${action}`, { method: 'POST', headers: jsonHeaders,
+            body: JSON.stringify(action === 'start' ? { links, showBrowser: showCheckBrowser } : {}) }) : await api('link-check');
+        if (!current()) return;
+        linkCheck = next;
+        linkCheckResults.clear();
+        for (const result of next.results ?? []) linkCheckResults.set(result.link, result);
+        renderLinkCheck();
+    } catch (error) {
+        if (current()) {
+            const node = byId('link-check-error');
+            node.textContent = error.message; node.hidden = false;
+        }
+    } finally {
+        if (action) linkCheckBusy = false;
+        if (current()) {
+            updateLinkControls();
+            if (checkActive()) linkCheckTimer = setTimeout(() => void refreshLinkCheck(), 1500);
+        }
     }
 }
 
@@ -427,7 +522,7 @@ async function saveLinks(event) {
 
 function showUpdate() {
     results.setAttribute('aria-busy', 'false');
-    byId('summary').textContent = '按已保存的链接运行一轮下载。';
+    byId('summary').textContent = '按已保存的链接运行一轮下载，优先处理从未更新或最久未更新的作者。';
     results.innerHTML = `<section class="update-panel" aria-label="下载任务">
         <div class="update-controls">
             <div>
@@ -439,10 +534,53 @@ function showUpdate() {
                 <button class="secondary danger" type="button" data-update-action="stop" disabled>停止更新</button>
             </div>
         </div>
+        <div class="update-overall">
+            <div class="update-progress-label"><strong id="update-link-progress"></strong><strong id="update-percent">—</strong></div>
+            <progress id="update-link-bar" max="1" value="0" aria-label="链接总进度"></progress>
+            <p class="summary">总进度按链接计算，作品数量在抓取列表后确定。</p>
+        </div>
+        <div class="update-metrics">
+            <div><span>已下载作品</span><strong id="update-success">0</strong></div>
+            <div><span>已跳过作品</span><strong id="update-skipped">0</strong></div>
+            <div><span>作品失败</span><strong id="update-failed">0</strong></div>
+            <div><span>链接失败</span><strong id="update-failedUrls">0</strong></div>
+        </div>
+        <dl class="update-current">
+            <div><dt>当前作者</dt><dd id="update-author">—</dd></div>
+            <div><dt>当前阶段</dt><dd id="update-phase">尚未开始</dd></div>
+            <div><dt>已用时间</dt><dd id="update-elapsed">—</dd></div>
+            <div><dt>进度更新</dt><dd id="update-freshness">尚未收到进度</dd></div>
+        </dl>
+        <p id="update-url" class="summary update-url" hidden></p>
+        <div class="update-items">
+            <div class="update-progress-label"><span>本组作品</span><span id="update-itemsText"></span></div>
+            <progress id="update-item-bar" max="1" value="0" aria-label="本组作品进度"></progress>
+        </div>
+        <p id="update-detail" class="summary" hidden></p>
+        <p id="update-queueText" class="summary" hidden></p>
+        <p id="update-file" class="summary" hidden></p>
+        <p id="update-message" class="update-message" hidden></p>
         <p id="update-details" class="summary" hidden></p>
         <p id="update-error" role="alert" hidden></p>
     </section>`;
     void refreshUpdate();
+}
+
+function renderUpdateProgress(task) {
+    const view = updateProgressView(task);
+    for (const field of ['author', 'phase', 'elapsed', 'freshness', 'url', 'detail', 'file', 'message',
+        'success', 'skipped', 'failed', 'failedUrls', 'percent', 'itemsText', 'queueText']) {
+        const node = byId(`update-${field}`);
+        const value = String(view[field]);
+        if (node.textContent !== value) node.textContent = value;
+        if (['url', 'detail', 'file', 'message', 'queueText'].includes(field)) node.hidden = !value;
+    }
+    byId('update-link-progress').textContent = view.linkText;
+    byId('update-link-bar').max = view.total || 1;
+    byId('update-link-bar').value = view.completed;
+    byId('update-item-bar').max = view.itemsTotal || 1;
+    if (view.itemsIndeterminate) byId('update-item-bar').removeAttribute('value');
+    else byId('update-item-bar').value = view.itemsCompleted;
 }
 
 async function refreshUpdate(action) {
@@ -472,6 +610,7 @@ async function refreshUpdate(action) {
             next.finishedAt && `结束于 ${date.format(new Date(next.finishedAt))}`,
         ].filter(Boolean).join(' · ');
         details.hidden = !details.textContent;
+        renderUpdateProgress(next);
         const error = next.error ?? '';
         if (message.textContent !== error) message.textContent = error;
         message.hidden = !error;
@@ -494,6 +633,8 @@ async function refreshUpdate(action) {
 function navigate() {
     clearTimeout(searchTimer);
     clearTimeout(updateTimer);
+    clearTimeout(linkCheckTimer);
+    ++linkCheckVersion;
     if (modal.open) modal.close();
     ++listVersion;
     workListPage = undefined;
@@ -797,19 +938,21 @@ async function showAuthorLinkRemoval(id) {
     }
 }
 
-async function showRemoval(kind, id, showFiles = false, batchIds = [], batchAuthorId) {
+async function showRemoval(kind, id, showFiles = false, batchIds = [], batchAuthorId, clearWorks = false) {
     const isAuthor = kind === 'authors';
     const batch = batchIds.length > 0;
     const subject = isAuthor ? '作者' : '作品';
-    const title = batch ? `批量删除${subject}` : showFiles ? '作品文件清单' : `删除${subject}`;
-    const endpoint = batch ? isAuthor ? 'authors/batch-removal' : `authors/${encodeURIComponent(batchAuthorId)}/works/batch-removal`
+    const title = clearWorks ? '清除作者所有作品' : batch ? `批量删除${subject}` : showFiles ? '作品文件清单' : `删除${subject}`;
+    const confirmLabel = clearWorks ? '清除文件并重置为未下载' : '永久删除';
+    const endpoint = clearWorks ? `authors/${encodeURIComponent(id)}/works/clear`
+        : batch ? isAuthor ? 'authors/batch-removal' : `authors/${encodeURIComponent(batchAuthorId)}/works/batch-removal`
         : `${kind}/${encodeURIComponent(id)}`;
     const version = openModal(title, 'remove-modal');
     const body = byId('modal-body');
     body.innerHTML = '<div class="empty"><span class="spinner" aria-hidden="true"></span><p>正在读取文件…</p></div>';
     try {
         const plan = batch ? await api(endpoint, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ ids: batchIds }) })
-            : await api(`${endpoint}/${isAuthor ? 'removal' : 'files'}`);
+            : await api(clearWorks ? endpoint : `${endpoint}/${isAuthor ? 'removal' : 'files'}`);
         if (version !== modalVersion || !modal.open) return;
         byId('modal-subtitle').textContent = batch ? `已选 ${number.format(isAuthor ? plan.authors.length : plan.workCount)} ${isAuthor ? '位作者' : '件作品'}` : plan.title;
         const summary = `${number.format(plan.workCount)} 件作品 · ${number.format(plan.copyCount)} 个副本 · ${number.format(plan.fileCount)} 个文件 · ${formatSize(plan.size)}`;
@@ -817,12 +960,13 @@ async function showRemoval(kind, id, showFiles = false, batchIds = [], batchAuth
         const authors = batch && isAuthor ? `<details class="file-copy" open><summary><strong>所选作者</strong></summary><ul class="removal-works">${plan.authors.map(author => `<li><span>${escape(author.name)}</span><small>${number.format(author.workCount)} 件作品</small></li>`).join('')}</ul></details>` : '';
         const listing = (isAuthor || batch) && authorWorks ? `<details class="file-copy" ${authors ? '' : 'open'}><summary><strong>受影响的作品</strong></summary><ul class="removal-works">${authorWorks}</ul>${plan.workCount > plan.works.length ? `<p class="summary more-works">此处显示前 ${plan.works.length} 件，全部 ${number.format(plan.workCount)} 件都在删除范围内。</p>` : ''}</details>`
             : (plan.copies ?? []).map(fileList).join('');
-        const scope = isAuthor ? `${batch ? '所选作者' : '此作者'}的全部本地作品副本和对应数据库记录将永久删除，同时移除配置中匹配的 ${number.format(plan.removedLinks ?? 0)} 条作者主页链接。删除后无法从资料库恢复。`
+        const scope = clearWorks ? `将清除此作者的全部本地作品，包括其他分页和当前筛选条件之外的作品。保留下载链接和数据库作品记录，将 ${number.format(plan.resetWorks ?? 0)} 条作品记录重置为未下载，下次手动更新时可重新下载。本地文件清除后无法从资料库恢复。`
+            : isAuthor ? `${batch ? '所选作者' : '此作者'}的全部本地作品副本和对应数据库记录将永久删除，同时移除配置中匹配的 ${number.format(plan.removedLinks ?? 0)} 条作者主页链接。删除后无法从资料库恢复。`
             : `${batch ? '所选作品' : '此作品'}的本地副本和对应数据库记录将永久删除。平铺文件按清单删除。删除后无法从资料库恢复。`;
         const errors = plan.errors.length ? `<div class="player-error" role="alert">清单无法完整读取，请检查目录后刷新数据库。<ul>${plan.errors.slice(0, 5).map(error => `<li>${escape(error)}</li>`).join('')}</ul></div>` : '';
         const back = isAuthor || batch ? '<button class="secondary" type="button" data-dismiss>取消</button>' : `<button class="secondary" type="button" data-work-back="${escape(id)}">返回作品</button>`;
         body.innerHTML = `<p class="removal-count">${summary}</p>${authors}${listing}<p class="summary removal-scope">${scope}</p>${errors}
-            <p id="removal-error" class="player-error" role="alert" hidden></p><div class="form-actions">${back}<button id="confirm-removal" class="primary danger" type="button" ${plan.token ? '' : 'disabled'}>永久删除</button></div>`;
+            <p id="removal-error" class="player-error" role="alert" hidden></p><div class="form-actions">${back}<button id="confirm-removal" class="primary danger" type="button" ${plan.token ? '' : 'disabled'}>${confirmLabel}</button></div>`;
         byId('confirm-removal').addEventListener('click', async () => {
             if (deleting) return;
             deleting = true;
@@ -832,7 +976,8 @@ async function showRemoval(kind, id, showFiles = false, batchIds = [], batchAuth
             try {
                 const result = await api(endpoint, { method: 'DELETE', headers: jsonHeaders,
                     body: JSON.stringify({ mode: 'permanent', token: plan.token, ids: batch ? batchIds : undefined }) });
-                if (isAuthor && !linksChanged()) linkConfig = undefined;
+                if (isAuthor && !clearWorks && !linksChanged()) linkConfig = undefined;
+                if (clearWorks) selectedWorks.clear();
                 const selection = isAuthor ? selectedAuthors : selectedWorks;
                 for (const selected of batch ? batchIds : [id]) selection.delete(selected);
                 updateSelection();
@@ -847,21 +992,21 @@ async function showRemoval(kind, id, showFiles = false, batchIds = [], batchAuth
                 } else if (route.view === 'issues' && !status.scannedAt) void refreshStatus({ rescan: true });
                 else void loadList();
                 if (showReceipt) {
-                    openModal(batch ? `已删除 ${number.format(batchIds.length)} ${isAuthor ? '位作者' : '件作品'}` : `已删除${subject}`, 'review-modal');
+                    openModal(clearWorks ? '已清除作者作品' : batch ? `已删除 ${number.format(batchIds.length)} ${isAuthor ? '位作者' : '件作品'}` : `已删除${subject}`, 'review-modal');
                     const scanWarning = result.databaseError ? '<p class="player-error">无法读取更新后的数据库，请刷新页面。</p>' : '';
-                    body.innerHTML = `<p class="summary">已永久删除 ${number.format(result.deletedFiles)} 个文件和 ${number.format(result.deletedDirectories)} 个目录。${isAuthor ? `已移除 ${number.format(result.removedLinks ?? 0)} 条作者主页链接。` : ''}</p>${scanWarning}<div class="form-actions"><button class="secondary" type="button" data-dismiss>完成</button></div>`;
-                } else showToast('永久删除已完成');
+                    body.innerHTML = `<p class="summary">已永久删除 ${number.format(result.deletedFiles)} 个文件和 ${number.format(result.deletedDirectories)} 个目录。${clearWorks ? `已将 ${number.format(result.resetWorks ?? 0)} 条作品记录重置为未下载，下载链接已保留。` : isAuthor ? `已移除 ${number.format(result.removedLinks ?? 0)} 条作者主页链接。` : ''}</p>${scanWarning}<div class="form-actions"><button class="secondary" type="button" data-dismiss>完成</button></div>`;
+                } else showToast(clearWorks ? '作品文件已清除，状态已重置为未下载' : '永久删除已完成');
             } catch (error) {
                 if (version === modalVersion && modal.open) {
                     const message = byId('removal-error');
                     message.textContent = error.message;
                     message.hidden = false;
-                    byId('confirm-removal').textContent = '永久删除';
+                    byId('confirm-removal').textContent = confirmLabel;
                     const retry = document.createElement('button');
                     retry.type = 'button';
                     retry.className = 'secondary';
                     retry.textContent = '重新读取清单';
-                    retry.addEventListener('click', () => void showRemoval(kind, id, showFiles, batchIds, batchAuthorId));
+                    retry.addEventListener('click', () => void showRemoval(kind, id, showFiles, batchIds, batchAuthorId, clearWorks));
                     message.after(retry);
                     controls.splice(controls.indexOf(byId('confirm-removal')), 1);
                 } else showToast(error.message, true);
@@ -951,6 +1096,7 @@ results.addEventListener('click', event => {
     if (item.hasAttribute('data-retry')) void loadList({ showLoading: true });
     if (item.hasAttribute('data-rescan')) void refreshStatus({ rescan: true });
     if (item.hasAttribute('data-reload-links')) void loadLinks({ reload: true });
+    if (item.hasAttribute('data-check-link')) void refreshLinkCheck('start', [linkDraft[Number(item.dataset.checkLink)]]);
     if (item.dataset.updateAction) void refreshUpdate(item.dataset.updateAction);
     if (item.hasAttribute('data-remove-link')) {
         const index = Number(item.dataset.removeLink);
@@ -969,6 +1115,8 @@ pager.addEventListener('submit', event => {
 });
 byId('scan-button').addEventListener('click', () => void refreshStatus({ rescan: true }));
 byId('header-action').addEventListener('click', event => {
+    const clear = event.target.closest('button[data-clear-author-works]');
+    if (clear) void showRemoval('authors', clear.dataset.clearAuthorWorks, false, [], undefined, true);
     const author = event.target.closest('button[data-remove-author]');
     if (author) void showRemoval('authors', author.dataset.removeAuthor);
     const link = event.target.closest('button[data-remove-author-links]');
@@ -1017,5 +1165,6 @@ modal.addEventListener('close', () => {
     workPreview = undefined;
     clearModalBody();
 });
+byId('back').addEventListener('click', () => window.history.back());
 window.addEventListener('hashchange', navigate);
 navigate();

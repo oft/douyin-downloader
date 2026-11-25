@@ -18,7 +18,11 @@ from core import (
     LoginRequiredError,
     URLParser,
 )
+from core.api_client import UserUnavailableError
+from core.browser_session import BrowserSession
+from core.downloader_base import DownloadResult
 from storage import Database, FileManager
+from utils.browser_runtime import BrowserUnavailableError, check_browser_runtime
 from utils.logger import set_console_log_level, setup_logger
 from utils.notifier import build_notifier
 from utils.validators import is_short_url, normalize_short_url
@@ -29,6 +33,7 @@ display = ProgressDisplay()
 AGENT_SUBCOMMAND = "agent"
 EXIT_ALL_FAILED = 1
 EXIT_LOGIN_REQUIRED = 3
+EXIT_ENVIRONMENT = 4
 
 
 def _as_bool(value: Any, default: bool = True) -> bool:
@@ -52,7 +57,7 @@ def _batch_exit_code(all_results, failed_urls: int, login_failed: bool):
     return None
 
 
-async def _run_with_relogin(make_coro, cookie_manager, *, serve=False, allow_relogin=True):
+async def _run_with_relogin(make_coro, cookie_manager, *, serve=False, allow_relogin=True, progress_reporter=None):
     """Run make_coro(); on LoginRequiredError, relogin once and retry.
 
     make_coro is a zero-arg callable returning a fresh coroutine each call,
@@ -61,33 +66,34 @@ async def _run_with_relogin(make_coro, cookie_manager, *, serve=False, allow_rel
     (not a merge), and both call sites read their cookies from it on retry.
     allow_relogin=False：本次运行里登录已经失败过，不再弹浏览器，直接抛出。
     """
+    reporter = progress_reporter if progress_reporter is not None else display
     for attempt in range(2):
         try:
             return await make_coro()
         except LoginRequiredError as exc:
             interactive = can_interactive_login(serve=serve)
             if attempt == 1 or not interactive or not allow_relogin:
-                display.print_error(
+                reporter.print_error(
                     f"登录态失效，需要重新登录（status {exc.status_code}）："
                     f"{exc.status_msg or '请先登录'}。"
                 )
                 if not interactive:
-                    display.print_warning(
+                    reporter.print_warning(
                         "当前为非交互环境，未自动打开浏览器。请手动更新 "
                         "config/cookies.json（或运行 python tools/cookie_fetcher.py 登录）。"
                     )
                 raise
-            display.print_warning(
+            reporter.print_warning(
                 f"检测到未登录（status {exc.status_code}），开始重新登录…"
             )
             new_cookies = await interactive_relogin()
             if not new_cookies:
-                display.print_error("重新登录未完成。")
+                reporter.print_error("重新登录未完成。")
                 raise
             cookie_manager.set_cookies(new_cookies)
             # 整条 URL 会重跑，上一轮已结算条目的原因不能再计一遍。
-            display.rollback_url_item_reasons()
-            display.print_success("已更新登录态，正在重试…")
+            reporter.rollback_url_item_reasons()
+            reporter.print_success("已更新登录态，正在重试…")
 
 
 async def download_url(
@@ -96,9 +102,12 @@ async def download_url(
     cookie_manager: CookieManager,
     database: Database = None,
     progress_reporter: ProgressDisplay = None,
+    browser_session=None,
+    stream_downloads=False,
 ):
     if progress_reporter:
         progress_reporter.advance_step("初始化", "创建下载组件")
+    output = progress_reporter if progress_reporter is not None else display
     file_manager = FileManager(config.get("path"))
     rate_limiter = RateLimiter(max_per_second=float(config.get("rate_limit", 2) or 2))
     retry_handler = RetryHandler(max_retries=config.get("retry_times", 3))
@@ -106,10 +115,10 @@ async def download_url(
 
     original_url = url
 
-    async with DouyinAPIClient(
-        cookie_manager.get_cookies(),
-        proxy=config.get("proxy"),
-    ) as api_client:
+    client_options = {"proxy": config.get("proxy")}
+    if browser_session is not None:
+        client_options["browser_session"] = browser_session
+    async with DouyinAPIClient(cookie_manager.get_cookies(), **client_options) as api_client:
         # CLI browser fallback must reuse the explicitly configured login session.
         # Desktop manages its browser session separately.
         api_client._BROWSER_COOKIE_BLOCKLIST = set()
@@ -123,14 +132,14 @@ async def download_url(
             else:
                 if progress_reporter:
                     progress_reporter.update_step("解析链接", "短链解析失败")
-                display.print_error(f"Failed to resolve short URL: {url}")
+                output.print_error(f"Failed to resolve short URL: {url}")
                 return None
 
         parsed = URLParser.parse(url)
         if not parsed:
             if progress_reporter:
                 progress_reporter.update_step("解析链接", "URL 解析失败")
-            display.print_error(f"Failed to parse URL: {url}")
+            output.print_error(f"Failed to parse URL: {url}")
             return None
 
         # 能力门禁：这些类型解析得出来，但永远不会有下载器（见
@@ -140,11 +149,11 @@ async def download_url(
         if gated_detail:
             if progress_reporter:
                 progress_reporter.update_step("解析链接", gated_detail)
-            display.print_error(gated_detail)
+            output.print_error(gated_detail)
             return None
 
         if not progress_reporter:
-            display.print_info(f"URL type: {parsed['type']}")
+            output.print_info(f"URL type: {parsed['type']}")
         if progress_reporter:
             progress_reporter.advance_step("创建下载器", f"URL 类型: {parsed['type']}")
 
@@ -164,13 +173,18 @@ async def download_url(
         if not downloader:
             if progress_reporter:
                 progress_reporter.update_step("创建下载器", "未找到匹配下载器")
-            display.print_error(f"No downloader found for type: {parsed['type']}")
+            output.print_error(f"No downloader found for type: {parsed['type']}")
             return None
+
+        downloader.stream_downloads = stream_downloads
 
         if progress_reporter:
             progress_reporter.advance_step("执行下载", "开始拉取与下载资源")
         try:
             result = await downloader.download(parsed)
+        except UserUnavailableError as exc:
+            output.print_warning(f"跳过用户主页 {url}：{exc.reason}")
+            return DownloadResult()
         except LoginRequiredError:
             # 交给 _run_with_relogin 重新登录后重试；恢复不了时由调用方记为该 URL 失败。
             raise
@@ -181,7 +195,7 @@ async def download_url(
             # still telling the user why the URL was skipped.
             if progress_reporter:
                 progress_reporter.update_step("执行下载", f"失败：{exc}")
-            display.print_error(f"Download failed for {url}: {exc}")
+            output.print_error(f"Download failed for {url}: {exc}")
             return None
 
         if progress_reporter:
@@ -218,14 +232,16 @@ async def download_url(
         comments_note = getattr(downloader, "comments_incomplete_note", None)
         note = comments_note() if callable(comments_note) else None
         if note:
-            display.print_warning(note)
+            output.print_warning(note)
 
         return result
 
 
-async def main_async(args, *, database_path=None, on_download_ready=None):
+async def main_async(args, *, database_path=None, on_download_ready=None, progress_reporter=None,
+                     browser_preflight=False, url_scheduler=None, stream_downloads=False):
+    reporter = progress_reporter if progress_reporter is not None else display
     if not args.serve:
-        display.show_banner()
+        reporter.show_banner()
 
     if args.config:
         config_path = args.config
@@ -236,7 +252,7 @@ async def main_async(args, *, database_path=None, on_download_ready=None):
     # 允许以默认配置运行（只要命令行提供了 --path）。
     if not Path(config_path).exists():
         if not (args.hot_board is not None or args.search or args.serve):
-            display.print_error(f"Config file not found: {config_path}")
+            reporter.print_error(f"Config file not found: {config_path}")
             return
         # For ``--serve`` we still pass the (yet-missing) path so later
         # ``config.save()`` calls from the REST settings endpoint create
@@ -277,7 +293,7 @@ async def main_async(args, *, database_path=None, on_download_ready=None):
         config.update(thread=args.thread)
 
     if not config.validate():
-        display.print_error("Invalid configuration: missing required fields")
+        reporter.print_error("Invalid configuration: missing required fields")
         return
 
     cookies = config.get_cookies()
@@ -285,7 +301,25 @@ async def main_async(args, *, database_path=None, on_download_ready=None):
     cookie_manager.set_cookies(cookies)
 
     if not cookie_manager.validate_cookies():
-        display.print_warning("Cookies may be invalid or incomplete")
+        reporter.print_warning("Cookies may be invalid or incomplete")
+
+    browser_config = config.get("browser_fallback", {}) or {}
+    profile_download = any(
+        (URLParser.parse(url) or {}).get("type") == "user" or is_short_url(url)
+        for url in config.get_links()
+    )
+    if (browser_preflight and "post" in config.get("mode", []) and profile_download
+            and _as_bool(browser_config.get("enabled", True))):
+        reporter.update_step("检查浏览器环境", "检查浏览器组件和可执行文件")
+        try:
+            browser_name = await check_browser_runtime(
+                headless=_as_bool(browser_config.get("headless", False), default=False)
+            )
+        except BrowserUnavailableError as exc:
+            reporter.print_error(str(exc))
+            return EXIT_ENVIRONMENT
+        reporter.update_step("浏览器已就绪", browser_name)
+        reporter.print_info(f"浏览器已就绪：{browser_name}")
 
     database = None
     if database_path is not None or config.get("database"):
@@ -294,15 +328,16 @@ async def main_async(args, *, database_path=None, on_download_ready=None):
         )
         database = Database(db_path=str(db_path), download_root=config.get("path"))
         await database.initialize()
-        display.print_success("Database initialized")
+        reporter.print_success("Database initialized")
     await _recover_live_recordings(database, config)
 
     urls = config.get_links()
-    display.print_info(f"Found {len(urls)} URL(s) to process")
+    reporter.print_info(f"Found {len(urls)} URL(s) to process")
 
     all_results = []
     failed_urls = 0
     login_failed = False
+    browser_failed = False
     progress_config = config.get("progress", {}) or {}
     quiet_by_config = _as_bool(progress_config.get("quiet_logs", True), default=True)
     quiet_progress_logs = quiet_by_config and not (args.verbose or args.show_warnings)
@@ -311,49 +346,65 @@ async def main_async(args, *, database_path=None, on_download_ready=None):
         # 默认静默控制台日志，下载完成后再恢复。
         set_console_log_level(logging.CRITICAL)
 
-    display.start_download_session(len(urls))
+    browser_session = BrowserSession()
     try:
+        # The library supplies its persistent scheduling policy; normal CLI order is unchanged.
+        if url_scheduler is not None:
+            urls = await url_scheduler.order(urls)
+            reporter.print_info("更新顺序：从未更新优先，其次按最近尝试时间从旧到新")
+        reporter.start_download_session(len(urls))
         if on_download_ready is not None:
             on_download_ready()
         for i, url in enumerate(urls, 1):
-            display.start_url(i, len(urls), url)
+            reporter.start_url(i, len(urls), url)
 
             try:
-                result = await _run_with_relogin(
-                    lambda u=url: download_url(
-                        u,
-                        config,
+                async def process_url():
+                    return await _run_with_relogin(
+                        lambda u=url: download_url(
+                            u,
+                            config,
+                            cookie_manager,
+                            database,
+                            progress_reporter=reporter,
+                            browser_session=browser_session,
+                            stream_downloads=stream_downloads,
+                        ),
                         cookie_manager,
-                        database,
-                        progress_reporter=display,
-                    ),
-                    cookie_manager,
-                    serve=False,
-                    # 登录失败过一次就不再重新登录，免得每个 URL 都弹一次浏览器
-                    allow_relogin=not login_failed,
-                )
+                        serve=False,
+                        progress_reporter=reporter,
+                        # 登录失败过一次就不再重新登录，免得每个 URL 都弹一次浏览器
+                        allow_relogin=not login_failed,
+                    )
+
+                result = (await url_scheduler.run(url, process_url)
+                          if url_scheduler is not None else await process_url())
+            except BrowserUnavailableError as exc:
+                browser_failed = True
+                reporter.print_error(str(exc))
+                reporter.fail_url(str(exc))
+                break
             except LoginRequiredError:
                 # 登录恢复不了：这个 URL 记失败，其余 URL 照常处理，最后以退出码 3 收尾
                 login_failed = True
                 failed_urls += 1
-                display.fail_url("登录态失效，需要重新登录")
+                reporter.fail_url("登录态失效，需要重新登录")
                 continue
             if result:
                 all_results.append(result)
-                display.complete_url(result)
+                reporter.complete_url(result)
             else:
                 failed_urls += 1
-                display.fail_url("下载失败或链接无效")
+                reporter.fail_url("下载未完成，详见具体错误")
     finally:
-        display.stop_download_session()
+        await browser_session.close()
+        reporter.stop_download_session()
         if database is not None:
             await database.close()
         if quiet_progress_logs:
             set_console_log_level(logging.ERROR)
 
     if all_results:
-        from core.downloader_base import DownloadResult
-
         total_result = DownloadResult()
         for r in all_results:
             total_result.total += r.total
@@ -361,15 +412,15 @@ async def main_async(args, *, database_path=None, on_download_ready=None):
             total_result.failed += r.failed
             total_result.skipped += r.skipped
 
-        display.print_success("\n=== Overall Summary ===")
-        display.show_result(total_result)
-        display.show_item_reasons()
+        reporter.print_success("\n=== Overall Summary ===")
+        reporter.show_result(total_result)
+        reporter.show_item_reasons()
 
         await _dispatch_notifications(config, total_result, len(urls))
     else:
         # 所有链接都失败时，也发通知（若启用）
         await _dispatch_notifications(config, None, len(urls))
-    return _batch_exit_code(all_results, failed_urls, login_failed)
+    return EXIT_ENVIRONMENT if browser_failed else _batch_exit_code(all_results, failed_urls, login_failed)
 
 
 async def _run_discovery_subcommand(

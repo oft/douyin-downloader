@@ -49,7 +49,7 @@ A Python-based Douyin (TikTok China) batch downloader that fetches videos, galle
 - **Sync script:** `../douyin-downloader-desktop/scripts/sync-to-cli.sh` copies all shared files from the desktop project here. Run `--check` to detect drift.
 - **Intentional divergences** (these files differ by design):
   - `cli/main.py` — CLI omits desktop-only `_verify_self_checksum()` and `_enforce_license_at_startup()`.
-  - `cli/main.py` — The fork's local library updater uses optional `main_async()` arguments for the library database path and a callback that starts its stop listener after initialization.
+  - `cli/main.py` — The fork's local library updater uses optional `main_async()` arguments for the library database path, a callback that starts its stop listener after initialization, and a per-run progress reporter that sends JSON snapshots without replacing the global CLI display.
   - `run.py` — CLI is a simple bootstrap; desktop has sidecar startup + data-dir migration.
   - `server/app.py`, `server/jobs.py` — CLI server is a simplified subset; desktop adds license, SSE, overrides, cancel.
   - `control/__init__.py` — CLI doesn't export `ProgressReporter` classes (desktop UI only).

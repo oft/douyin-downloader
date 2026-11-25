@@ -2,6 +2,9 @@ import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { statSync } from 'node:fs';
 import path from 'node:path';
+import { createInterface } from 'node:readline';
+import { parseUpdateProgress } from './update-progress.ts';
+import type { UpdateProgress } from './update-progress.ts';
 
 type UpdateStatus = {
     state: 'idle' | 'starting' | 'running' | 'stopping' | 'stopped' | 'completed' | 'failed';
@@ -9,11 +12,12 @@ type UpdateStatus = {
     finishedAt?: string;
     exitCode?: number;
     error?: string;
+    progress?: UpdateProgress;
 };
 
 const exitErrors: Partial<Record<number, string>> = {
     3: '登录已失效，请更新下载器的登录信息后重试。',
-    4: '当前 Python 缺少下载器依赖。请安装 requirements.txt 或检查 PYTHON_EXECUTABLE。',
+    4: '下载运行环境未就绪。请查看进度中的具体原因，检查 Python 依赖、浏览器及 PYTHON_EXECUTABLE。',
 };
 
 export function resolveUpdatePython(projectRoot: string, env: NodeJS.ProcessEnv = process.env) {
@@ -31,32 +35,40 @@ export class UpdateJob {
     private current: UpdateStatus = { state: 'idle' };
     private stopTimer?: ReturnType<typeof setTimeout>;
     private forced = false;
+    private onLine?: (line: string) => void;
 
-    constructor(command: string, args: string[], cwd: string) {
+    constructor(command: string, args: string[], cwd: string, onLine?: (line: string) => void) {
         this.command = command;
         this.args = args;
         this.cwd = cwd;
+        this.onLine = onLine;
     }
 
     get active() { return this.child !== undefined; }
     get status() { return this.current; }
 
-    start() {
+    start(input?: unknown) {
         if (this.child) return this.status;
         const startedAt = new Date().toISOString();
         const child = spawn(this.command, this.args, {
             cwd: this.cwd,
-            stdio: ['pipe', 'inherit', 'inherit'],
+            stdio: ['pipe', 'pipe', 'inherit'],
             detached: process.platform !== 'win32',
             windowsHide: true,
         });
         this.child = child;
         this.current = { state: 'starting', startedAt };
         this.forced = false;
+        const output = child.stdout && createInterface({ input: child.stdout });
+        output?.on('line', line => {
+            const progress = parseUpdateProgress(line);
+            if (progress && this.child === child) this.current = { ...this.current, progress };
+            if (this.child === child) this.onLine?.(line);
+        });
         let spawnError: string | undefined;
         child.stdin?.on('error', () => { /* The child may exit before receiving the stop request. */ });
         child.once('spawn', () => {
-            if (this.current.state === 'starting') this.current = { state: 'running', startedAt };
+            if (this.current.state === 'starting') this.current = { ...this.current, state: 'running' };
         });
         child.on('error', (error: NodeJS.ErrnoException) => {
             if (!child.pid) {
@@ -66,10 +78,12 @@ export class UpdateJob {
             }
         });
         child.once('close', (code, signal) => {
+            output?.close();
             clearTimeout(this.stopTimer);
             this.stopTimer = undefined;
             const finishedAt = new Date().toISOString();
-            const outcome = { startedAt, finishedAt, exitCode: code ?? undefined };
+            const outcome = { startedAt, finishedAt, exitCode: code ?? undefined,
+                ...(this.current.progress ? { progress: this.current.progress } : {}) };
             if (this.current.state === 'stopping' && (code === 130 || this.forced || signal)) {
                 this.current = { ...outcome, state: 'stopped' };
             } else if (code === 0) {
@@ -81,6 +95,7 @@ export class UpdateJob {
             }
             this.child = undefined;
         });
+        if (input !== undefined) child.stdin?.write(JSON.stringify(input) + '\n');
         return this.status;
     }
 

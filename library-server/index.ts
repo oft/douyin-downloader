@@ -8,14 +8,16 @@ import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { readLibraryConfig } from './util/config.ts';
 import { LinkConfigError, readConfigLinks, saveConfigLinks } from './util/config-links.ts';
-import { inspectCatalogRows, readDatabaseCatalog, scanCatalog } from './util/catalog.ts';
-import { reconcileDeletedWorks, resolveMediaPath } from './util/db.ts';
+import { inspectCatalogRows, scanCatalog } from './util/catalog.ts';
+import { readCatalogInWorker } from './util/catalog-reader.ts';
+import { authorWorkIds, reconcileDeletedWorks, resetDownloadedWorks, resolveMediaPath } from './util/db.ts';
 import type { Catalog, DatabaseCatalog, Source, Work } from './util/catalog.ts';
 import { ReviewStore } from './util/reviews.ts';
 import type { ReviewStatus } from './util/reviews.ts';
 import { deletePermanently, removalPlan } from './util/library-files.ts';
 import type { RemovalKind } from './util/library-files.ts';
 import { resolveUpdatePython, UpdateJob } from './util/update-job.ts';
+import { LinkCheckJob } from './util/link-check-job.ts';
 import { createHeifPreview, isoImageType } from './util/browser-image.ts';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
@@ -28,9 +30,12 @@ const updateJob = new UpdateJob(python, [
     '-u', path.join(directory, 'scripts', 'update-library.py'), configFile, downloadRoot, databaseFile,
 ], projectRoot);
 const reviewFile = process.env.CATALOG_REVIEW_FILE ? path.resolve(process.env.CATALOG_REVIEW_FILE) : path.join(directory, 'data', 'catalog-reviews.json');
+const linkCheckJob = new LinkCheckJob(python, [
+    '-u', path.join(directory, 'scripts', 'check-links.py'), configFile,
+], projectRoot);
 const reviewStatuses = ['pending', 'resolved', 'ignored'] as const;
 const sources: Source[] = ['post', 'like', 'mix', 'music', 'single', 'loose'];
-const textTypes: Record<string, string> = { 'index.html': 'text/html', 'app.js': 'text/javascript', 'profile-link.js': 'text/javascript', 'styles.css': 'text/css' };
+const textTypes: Record<string, string> = { 'index.html': 'text/html', 'app.js': 'text/javascript', 'profile-link.js': 'text/javascript', 'update-progress.js': 'text/javascript', 'link-check.js': 'text/javascript', 'styles.css': 'text/css' };
 const mediaTypes: Record<string, string> = { '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime', '.mkv': 'video/x-matroska',
     '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' };
 
@@ -40,6 +45,7 @@ let scanError: string | undefined;
 let reviews: ReviewStore | undefined;
 let removing = false;
 let databaseView: { stamp: string; snapshot: DatabaseCatalog } | undefined;
+let databaseRead: Promise<DatabaseCatalog> | undefined;
 const mediaPaths = new Map<string, { root: string; relativePath: string }>();
 
 async function fileStamp(file: string, optional = false) {
@@ -60,10 +66,14 @@ async function loadDatabaseCatalog() {
     ]);
     const stamp = `${databaseStamp}|${walStamp}|${root}`;
     if (databaseView?.stamp === stamp) return databaseView.snapshot;
-    const snapshot = readDatabaseCatalog(root, databaseFile);
-    if (databaseView && databaseView.snapshot.root !== root) mediaPaths.clear();
-    databaseView = { stamp, snapshot };
-    return snapshot;
+    if (!databaseRead) {
+        databaseRead = readCatalogInWorker(root, databaseFile).then(snapshot => {
+            if (databaseView && databaseView.snapshot.root !== root) mediaPaths.clear();
+            databaseView = { stamp, snapshot };
+            return snapshot;
+        }).finally(() => { databaseRead = undefined; });
+    }
+    return databaseRead;
 }
 
 function databaseError(error: unknown) {
@@ -234,6 +244,25 @@ const requireLocalLinks: MiddlewareHandler = async (c, next) => {
 
 app.use('/api/catalog/links', requireLocalLinks);
 app.use('/api/catalog/authors/:id/links', requireLocalLinks);
+app.use('/api/catalog/link-check', requireLocalLinks);
+app.use('/api/catalog/link-check/*', requireLocalLinks);
+
+app.get('/api/catalog/link-check', c => c.json(linkCheckJob.status));
+app.post('/api/catalog/link-check/start', async c => {
+    if (!/^application\/json(?:\s*;|$)/i.test(c.req.header('Content-Type') ?? '')) return c.json({ error: '需要 JSON 请求' }, 415);
+    const body = await c.req.json().catch(() => null);
+    if (!body || !Array.isArray(body.links) || !body.links.length || body.links.length > 1000
+        || !body.links.every((link: unknown) => typeof link === 'string' && Boolean(link.trim()) && link.length <= 4096)
+        || (body.showBrowser !== undefined && typeof body.showBrowser !== 'boolean')) {
+        return c.json({ error: '请提交 1–1000 条非空链接，每条不超过 4096 字符' }, 400);
+    }
+    if (updateJob.active) return c.json({ error: '下载更新正在运行，请先停止更新或等待结束后再检测' }, 409);
+    return c.json(linkCheckJob.start(body.links, body.showBrowser === true), 202);
+});
+app.post('/api/catalog/link-check/stop', c => {
+    if (!/^application\/json(?:\s*;|$)/i.test(c.req.header('Content-Type') ?? '')) return c.json({ error: '需要 JSON 请求' }, 415);
+    return c.json(linkCheckJob.stop(), 202);
+});
 
 app.get('/api/catalog/link-authors', c => {
     if (!isLocalRequest(c)) return c.json({ error: '链接管理仅支持本机同源请求' }, 403);
@@ -271,6 +300,7 @@ app.use('/api/catalog/update/*', async (c, next) => {
 app.get('/api/catalog/update', c => c.json(updateJob.status));
 app.post('/api/catalog/update/start', c => {
     if (updateJob.active) return c.json(updateJob.status, 202);
+    if (linkCheckJob.active) return c.json({ error: '正在检测链接，请先停止检测或等待结束后再启动更新' }, 409);
     if (removing) return c.json({ error: '正在删除文件，请稍后再启动更新' }, 409);
     try {
         if (!readConfigLinks(configFile).links.some(link => link.trim())) {
@@ -395,7 +425,7 @@ app.get('/api/catalog/works/:id', c => browseDatabase(c, async snapshot => {
         copies: work.copies.map(({ flatFiles, ...copy }) => copy) });
 }));
 
-async function planRemoval(snapshot: DatabaseCatalog, kind: RemovalKind, ids: string[], authorId?: string) {
+async function planRemoval(snapshot: DatabaseCatalog, kind: RemovalKind, ids: string[], authorId?: string, clearWorks = false) {
     if (kind === 'authors' && ids.some(id => !snapshot.authorById.has(id))) return undefined;
     const selected = new Set(ids);
     const isSelected = (work: Work) => selected.has((kind === 'authors' ? work.authorId : work.id) ?? '');
@@ -419,25 +449,31 @@ async function planRemoval(snapshot: DatabaseCatalog, kind: RemovalKind, ids: st
     }));
     const plan = await removalPlan(local, kind, ids, protectedPaths);
     if (!plan) return undefined;
-    const linkPlan = kind === 'authors' ? planAuthorLinks(ids.map(id => snapshot.authorById.get(id)?.sharedKey)) : undefined;
+    const clearIds = clearWorks ? authorWorkIds(databaseFile, snapshot.authorById.get(ids[0]!)?.sharedKey,
+        local.works.flatMap(work => work.platformId ? [work.platformId] : [])) : undefined;
+    const linkPlan = kind === 'authors' && !clearWorks ? planAuthorLinks(ids.map(id => snapshot.authorById.get(id)?.sharedKey)) : undefined;
     if (plan.view.token && linkPlan) {
         plan.view.token = createHash('sha256').update(JSON.stringify([plan.view.token, linkPlan.config.revision])).digest('hex');
     }
-    return { local, plan, linkPlan };
+    if (plan.view.token && clearWorks) {
+        plan.view.token = createHash('sha256').update(JSON.stringify(['clear-author-works', plan.view.token, clearIds])).digest('hex');
+    }
+    return { local, plan, linkPlan, clearIds };
 }
 
-function previewRemoval(c: Context, kind: RemovalKind, ids: string[], authorId?: string) {
+function previewRemoval(c: Context, kind: RemovalKind, ids: string[], authorId?: string, clearWorks = false) {
     return browseDatabase(c, async snapshot => {
         if (removing) return c.json({ error: '正在删除文件，请稍后再查看' }, 409);
         try {
-            const result = await planRemoval(snapshot, kind, ids, authorId);
-            return result ? c.json({ ...result.plan.view, removedLinks: result.linkPlan?.matches.length ?? 0 })
+            const result = await planRemoval(snapshot, kind, ids, authorId, clearWorks);
+            return result ? c.json({ ...result.plan.view, removedLinks: result.linkPlan?.matches.length ?? 0,
+                ...(clearWorks ? { resetWorks: result.clearIds?.length ?? 0 } : {}) })
                 : c.json({ error: '部分选择已不存在，请刷新列表后重新选择' }, 404);
         } catch (error) { return linkConfigFailure(c, error, '无法读取删除范围或下载器配置'); }
     });
 }
 
-async function commitRemoval(c: Context, kind: RemovalKind, ids: string[], token: string, authorId?: string) {
+async function commitRemoval(c: Context, kind: RemovalKind, ids: string[], token: string, authorId?: string, clearWorks = false) {
     if (updateJob.active) return c.json({ error: '正在下载更新，请在更新结束后再删除' }, 409);
     if (scan || removing) return c.json({ error: '索引正在更新，请稍后再试' }, 409);
     removing = true;
@@ -448,16 +484,18 @@ async function commitRemoval(c: Context, kind: RemovalKind, ids: string[], token
     let deleted;
     let failure;
     let removedLinks = 0;
+    let clearIds: string[] = [];
     let linkChange: { before: ReturnType<typeof readConfigLinks>; saved: ReturnType<typeof saveConfigLinks> } | undefined;
     try {
         const snapshot = await loadDatabaseCatalog();
-        const result = await planRemoval(snapshot, kind, ids, authorId);
+        const result = await planRemoval(snapshot, kind, ids, authorId, clearWorks);
         if (!result) return c.json({ error: '部分选择已不存在，请刷新列表后重新选择' }, 404);
         const { local, plan, linkPlan } = result;
         if (plan.view.token !== token || await loadDatabaseCatalog() !== snapshot) {
             return c.json({ error: '文件或作品记录已变更，请重新查看删除范围' }, 409);
         }
         affectedWorks = local.works.flatMap(work => work.platformId ? [work.platformId] : []);
+        clearIds = result.clearIds ?? [];
         affectedAssets = [...local.assets.keys()];
         mediaRoot = local.root;
         // Save first so an unwritable configuration cannot leave media already deleted.
@@ -477,7 +515,11 @@ async function commitRemoval(c: Context, kind: RemovalKind, ids: string[], token
             catch { failure = `${failure ?? '删除未完成'}；配置链接恢复失败，请重新读取链接配置`; }
         }
         if (attempted) {
-            try { await reconcileDeletedWorks(databaseFile, mediaRoot, affectedWorks); }
+            try {
+                if (clearWorks) {
+                    if (deleted) resetDownloadedWorks(databaseFile, clearIds);
+                } else await reconcileDeletedWorks(databaseFile, mediaRoot, affectedWorks);
+            }
             catch (error) { failure ??= error instanceof Error ? error.message : '数据库更新失败'; }
             databaseView = undefined;
             catalog = undefined;
@@ -486,7 +528,8 @@ async function commitRemoval(c: Context, kind: RemovalKind, ids: string[], token
         }
         removing = false;
     }
-    return failure ? c.json({ error: failure }, 409) : c.json({ ...deleted, removedLinks, ...await currentStatus() });
+    return failure ? c.json({ error: failure }, 409) : c.json({ ...deleted, removedLinks,
+        ...(clearWorks ? { resetWorks: clearIds.length } : {}), ...await currentStatus() });
 }
 
 function isRemovalToken(body: unknown): body is { mode: 'permanent'; token: string } {
@@ -515,6 +558,15 @@ function batchRemoval(kind: RemovalKind, pathname: string) {
 
 batchRemoval('authors', '/api/catalog/authors/batch-removal');
 batchRemoval('works', '/api/catalog/authors/:authorId/works/batch-removal');
+
+app.get('/api/catalog/authors/:id/works/clear', c => previewRemoval(c, 'authors', [c.req.param('id')], undefined, true));
+app.delete('/api/catalog/authors/:id/works/clear', async c => {
+    if (!isLocalRequest(c)) return c.json({ error: '清除功能仅支持本机同源请求' }, 403);
+    if (!/^application\/json(?:\s*;|$)/i.test(c.req.header('Content-Type') ?? '')) return c.json({ error: '需要 JSON 请求' }, 415);
+    const body = await c.req.json().catch(() => null);
+    if (!isRemovalToken(body)) return c.json({ error: '请查看文件清单并确认清除所有作品' }, 400);
+    return commitRemoval(c, 'authors', [c.req.param('id')], body.token, undefined, true);
+});
 
 for (const kind of ['works', 'authors'] as const) {
     app.get(`/api/catalog/${kind}/:id/${kind === 'works' ? 'files' : 'removal'}`, c => previewRemoval(c, kind, [c.req.param('id')]));

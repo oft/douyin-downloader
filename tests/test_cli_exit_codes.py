@@ -1,18 +1,21 @@
 """人用 CLI 的退出码：登录失效 3、全部失败 1，其余保持 0。"""
 
+import asyncio
 import importlib
 import json
 import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from agent_mode.logging_guard import snapshot_logging
 from agent_mode.version import get_version
 from core import LoginRequiredError
+from core.api_client import UserUnavailableError
+from utils.browser_runtime import BrowserUnavailableError
 
 main_module = importlib.import_module("cli.main")
 
@@ -20,7 +23,7 @@ VIDEO_URL = "https://www.douyin.com/video/7300000000000000000"
 
 
 class _FakeAPIClient:
-    def __init__(self, _cookies, proxy=None):
+    def __init__(self, _cookies, proxy=None, browser_session=None):
         self.proxy = proxy
 
     async def __aenter__(self):
@@ -72,6 +75,17 @@ async def test_download_url_lets_login_required_through(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_download_url_still_swallows_other_errors(monkeypatch, tmp_path):
     assert await _download_with(monkeypatch, tmp_path, RuntimeError("boom")) is None
+
+
+@pytest.mark.asyncio
+async def test_download_url_skips_unavailable_user_without_failed_work(monkeypatch, tmp_path):
+    display = MagicMock()
+    monkeypatch.setattr(main_module, "display", display)
+    result = await _download_with(monkeypatch, tmp_path, UserUnavailableError("用户不存在"))
+
+    assert result.total == result.success == result.failed == result.skipped == 0
+    assert "用户不存在" in display.print_warning.call_args.args[0]
+    display.print_error.assert_not_called()
 
 
 @pytest.fixture(autouse=True)
@@ -184,6 +198,27 @@ async def test_main_async_missing_config_still_returns_none(monkeypatch, tmp_pat
     assert await main_module.main_async(args) is None
 
 
+async def test_library_scheduler_orders_real_batch_and_wraps_downloads(monkeypatch, tmp_path):
+    args = _prepare_main_async(monkeypatch, tmp_path, [_result(success=1)] * 3)
+    original = list(args.url)
+    visited = []
+    scheduler = SimpleNamespace(order=AsyncMock(return_value=list(reversed(original))))
+    async def scheduled_run(url, operation):
+        visited.append(url)
+        return await operation()
+    scheduler.run = scheduled_run
+    assert await main_module.main_async(args, url_scheduler=scheduler) is None
+    assert visited == list(reversed(original))
+    assert args.url == original
+    assert [call.args[2] for call in main_module.display.start_url.call_args_list] == visited
+
+
+async def test_normal_cli_keeps_configuration_order(monkeypatch, tmp_path):
+    args = _prepare_main_async(monkeypatch, tmp_path, [_result(success=1)] * 3)
+    assert await main_module.main_async(args) is None
+    assert [call.args[2] for call in main_module.display.start_url.call_args_list] == args.url
+
+
 def _track_relogin_and_notifications(monkeypatch, *, interactive):
     calls = {"relogin": 0, "notified": []}
 
@@ -198,6 +233,96 @@ def _track_relogin_and_notifications(monkeypatch, *, interactive):
     monkeypatch.setattr(main_module, "interactive_relogin", fake_relogin)
     monkeypatch.setattr(main_module, "_dispatch_notifications", fake_notify)
     return calls
+
+
+@pytest.mark.asyncio
+async def test_batch_continues_after_unavailable_user_without_relogin(monkeypatch, tmp_path):
+    download_url = main_module.download_url
+    args = _prepare_main_async(monkeypatch, tmp_path, [None, None])
+    args.url = ["https://www.douyin.com/user/missing-user", VIDEO_URL]
+    monkeypatch.setattr(main_module, "download_url", download_url)
+    monkeypatch.setattr(main_module, "DouyinAPIClient", _FakeAPIClient)
+    downloaders = iter(
+        [
+            _RaisingDownloader(UserUnavailableError("用户不存在")),
+            SimpleNamespace(download=AsyncMock(return_value=_result(success=1))),
+        ]
+    )
+    monkeypatch.setattr(
+        main_module.DownloaderFactory, "create", lambda *_a, **_k: next(downloaders)
+    )
+    calls = _track_relogin_and_notifications(monkeypatch, interactive=True)
+
+    assert await main_module.main_async(args) is None
+    assert main_module.display.complete_url.call_count == 2
+    main_module.display.fail_url.assert_not_called()
+    assert calls["relogin"] == 0
+    total = calls["notified"][0][0]
+    assert total.success == 1 and total.failed == 0
+
+
+@pytest.mark.asyncio
+async def test_browser_preflight_failure_never_starts_url_batch(monkeypatch, tmp_path):
+    args = _prepare_main_async(monkeypatch, tmp_path, [None, None])
+    monkeypatch.setattr(main_module.URLParser, "parse", lambda _url: {"type": "user"})
+    check = AsyncMock(side_effect=BrowserUnavailableError("浏览器未安装"))
+    download = AsyncMock()
+    monkeypatch.setattr(main_module, "check_browser_runtime", check)
+    monkeypatch.setattr(main_module, "download_url", download)
+
+    assert await main_module.main_async(args, browser_preflight=True) == main_module.EXIT_ENVIRONMENT
+    download.assert_not_awaited()
+    main_module.display.print_error.assert_called_with("浏览器未安装")
+
+
+@pytest.mark.asyncio
+async def test_optional_browser_is_not_required_for_ordinary_cli_downloads(monkeypatch, tmp_path):
+    args = _prepare_main_async(monkeypatch, tmp_path, [_result(success=1)])
+    monkeypatch.setattr(main_module.URLParser, "parse", lambda _url: {"type": "user"})
+    check = AsyncMock(side_effect=BrowserUnavailableError("not installed"))
+    monkeypatch.setattr(main_module, "check_browser_runtime", check)
+    assert await main_module.main_async(args) is None
+    check.assert_not_awaited()
+
+
+@pytest.mark.parametrize("outcome", ["complete", "cancel", "browser_failure"])
+@pytest.mark.asyncio
+async def test_main_owns_one_browser_session_for_all_urls_and_closes_it(monkeypatch, tmp_path, outcome):
+    args = _prepare_main_async(monkeypatch, tmp_path, [None, None])
+    session = SimpleNamespace(close=AsyncMock())
+    factory = MagicMock(return_value=session)
+    received = []
+
+    async def download(*_args, **kwargs):
+        received.append(kwargs["browser_session"])
+        if len(received) == 2:
+            if outcome == "cancel":
+                raise asyncio.CancelledError()
+            if outcome == "browser_failure":
+                raise BrowserUnavailableError("closed")
+        return _result(success=1)
+
+    monkeypatch.setattr(main_module, "BrowserSession", factory)
+    monkeypatch.setattr(main_module, "download_url", download)
+    if outcome == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await main_module.main_async(args)
+    else:
+        code = await main_module.main_async(args)
+        assert code == (main_module.EXIT_ENVIRONMENT if outcome == "browser_failure" else None)
+    assert received == [session, session]
+    factory.assert_called_once_with()
+    session.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_browser_launch_failure_stops_batch_instead_of_failing_every_link(monkeypatch, tmp_path):
+    args = _prepare_main_async(
+        monkeypatch, tmp_path, [BrowserUnavailableError("浏览器启动失败"), _result(success=1)]
+    )
+    assert await main_module.main_async(args) == main_module.EXIT_ENVIRONMENT
+    assert main_module.display.start_url.call_count == 1
+    assert main_module.display.fail_url.call_count == 1
 
 
 @pytest.mark.parametrize("interactive", [False, True])

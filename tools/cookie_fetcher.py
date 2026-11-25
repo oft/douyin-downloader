@@ -88,7 +88,13 @@ async def capture_cookies(args: argparse.Namespace) -> int:
 
     async with async_playwright() as p:
         browser_factory = getattr(p, args.browser)
-        browser = await browser_factory.launch(headless=args.headless)
+        from utils.browser_runtime import chromium_launch_options
+
+        launch_options = (
+            await chromium_launch_options(browser_factory, headless=args.headless)
+            if args.browser == "chromium" else {}
+        )
+        browser = await browser_factory.launch(headless=args.headless, **launch_options)
         context = await browser.new_context()
         page = await context.new_page()
         observed_cookie_headers: List[str] = []

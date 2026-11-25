@@ -33,6 +33,9 @@ _PostPageResult = Tuple[List[Dict[str, Any]], bool]
 _EMPTY_POST_LIST_MESSAGE = (
     "抖音接口未返回作品列表（可能触发了反爬限制），请稍后重试或尝试重新登录抖音刷新 Cookie"
 )
+_EMPTY_BROWSER_POST_LIST_MESSAGE = (
+    "浏览器未获取到作品列表，请检查目标主页是否有可访问作品或需要完成安全验证"
+)
 
 
 def _log_page_response(
@@ -73,15 +76,47 @@ class PostUserModeStrategy(BaseUserModeStrategy):
     _hard_truncation: Optional[str] = None
     # 失败页说得出具体原因(被拒绝 / 页面通道错误码)时的完整文案,否则 None。
     _failure_message: Optional[str] = None
+    _item_sink = None
+    _stream_limit_reached = False
+
+    async def download_mode(self, sec_uid, user_info, seen_aweme_ids=None):
+        if getattr(self.downloader, "stream_downloads", False) is not True:
+            return await super().download_mode(sec_uid, user_info, seen_aweme_ids)
+        from core.post_pipeline import PostDownloadPipeline
+
+        pipeline = PostDownloadPipeline(self, sec_uid, user_info, seen_aweme_ids)
+        self._item_sink = pipeline.offer
+        try:
+            result = await pipeline.run(lambda: self.collect_items(sec_uid, user_info))
+            self.incomplete_reason = result.incomplete_reason
+            return result
+        finally:
+            self._item_sink = None
 
     def apply_filters(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return super().apply_filters(non_mix_posts(items, self.downloader))
+
+    def filter_stream_items(self, items):
+        items = non_mix_posts(items, self.downloader)
+        items = self._filter_pinned_items(items)
+        items = self.downloader._filter_by_time(items)
+        return self._filter_by_media_type(items)
 
     def _filter_post_candidates(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return self._filter_by_media_type(non_mix_posts(items, self.downloader))
 
     async def collect_items(self, sec_uid: str, user_info: Dict[str, Any]) -> List[Dict[str, Any]]:
         self.incomplete_reason = None
+        if (getattr(self.downloader.api_client, "prefer_browser_posts", False) is True
+                and self._browser_recovery_available()):
+            self._reset_walk_state()
+            aweme_list: List[Dict[str, Any]] = []
+            await self._recover_with_browser(sec_uid, user_info, aweme_list)
+            if not aweme_list:
+                raise PageRequestFailedError(_EMPTY_BROWSER_POST_LIST_MESSAGE)
+            self._raw_items_seen = len(aweme_list)
+            self._report_walk_summary(aweme_list, user_info)
+            return aweme_list
         fetcher = getattr(self.downloader.api_client, self.api_method_name, None)
         if not callable(fetcher):
             logger.error("API client missing get_user_post")
@@ -92,6 +127,9 @@ class PostUserModeStrategy(BaseUserModeStrategy):
             recovered = await self._recover_with_browser(sec_uid, user_info, aweme_list)
             if not aweme_list:
                 # PageRequestFailedError 让 UserDownloader 接着跑剩下的模式。
+                if (getattr(self.downloader.api_client, "prefer_browser_posts", False) is True
+                        and self._browser_recovery_available()):
+                    raise PageRequestFailedError(_EMPTY_BROWSER_POST_LIST_MESSAGE)
                 raise PageRequestFailedError(self._failure_message or _EMPTY_POST_LIST_MESSAGE)
             if self._hard_truncation and not recovered:
                 self.incomplete_reason = self._hard_truncation
@@ -112,17 +150,23 @@ class PostUserModeStrategy(BaseUserModeStrategy):
         提示，honest 的原因由 ``_recover_user_post_with_browser`` 负责说。
         """
         before = len(aweme_list)
+        stream_options = {"on_items": self._item_sink} if self._item_sink is not None else {}
         if self._browser_recovery_available():
-            self.downloader._progress_update_step("拉取作品列表", "分页受限，尝试浏览器回补")
+            self.downloader._progress_update_step("浏览器采集", "正在通过浏览器获取作品列表")
         if self._media_type_filter_enabled() or mix_selected(self.downloader.config):
             await self.downloader._recover_user_post_with_browser(
                 sec_uid,
                 user_info,
                 aweme_list,
                 item_filter=self._filter_post_candidates,
+                **stream_options,
             )
         else:
-            await self.downloader._recover_user_post_with_browser(sec_uid, user_info, aweme_list)
+            await self.downloader._recover_user_post_with_browser(
+                sec_uid, user_info, aweme_list, **stream_options)
+        browser_note = getattr(self.downloader, "_browser_post_incomplete_reason", None)
+        if isinstance(browser_note, str) and browser_note:
+            self.incomplete_reason = browser_note
         return len(aweme_list) > before
 
     def _browser_recovery_available(self) -> bool:
@@ -139,7 +183,8 @@ class PostUserModeStrategy(BaseUserModeStrategy):
         用户看到的「主页 164 条、只下了 161 条」多半来自置顶排除，缺了
         这一行，差额无处解释。
         """
-        parts = [f"抓取完成，共 {self._raw_items_seen} 条"]
+        parts = [f"已获取 {self._raw_items_seen} 条（未确认取全）" if self.incomplete_reason
+                 else f"抓取完成，共 {self._raw_items_seen} 条"]
         if self.pinned_excluded:
             parts.append(f"已排除作者置顶 {self.pinned_excluded} 条，待下载 {len(aweme_list)} 条")
         profile_count = self._profile_aweme_count(user_info)
@@ -158,14 +203,19 @@ class PostUserModeStrategy(BaseUserModeStrategy):
             self.incomplete_reason or "-",
         )
 
-    async def _collect_api_items(self, sec_uid: str, user_info: Dict[str, Any]) -> _PostPageResult:
-        aweme_list: List[Dict[str, Any]] = []
-        max_cursor = raw_items_seen = page_number = candidate_count = 0
+    def _reset_walk_state(self) -> None:
         # 策略实例会被 UserDownloader 缓存复用，走查状态必须每轮清零。
+        self.incomplete_reason = None
         self.pinned_excluded = 0
         self._raw_items_seen = 0
         self._hard_truncation = None
         self._failure_message = None
+        self._stream_limit_reached = False
+
+    async def _collect_api_items(self, sec_uid: str, user_info: Dict[str, Any]) -> _PostPageResult:
+        aweme_list: List[Dict[str, Any]] = []
+        max_cursor = raw_items_seen = page_number = candidate_count = 0
+        self._reset_walk_state()
         number_limit = int(self.downloader.config.get("number", {}).get(self.mode_name, 0) or 0)
         time_boundary = self._time_boundary_for_config()
         self.downloader._progress_update_step("拉取作品列表", "分页抓取中")
@@ -187,6 +237,8 @@ class PostUserModeStrategy(BaseUserModeStrategy):
             page = self._normalize_page_data(page_data)
             page_items = self.select_items(page)
             raw_page_count = self._append_page_items(page, aweme_list)
+            if self._item_sink is not None and page_items:
+                self._stream_limit_reached = await self._item_sink(page_items) is False
             if raw_page_count == 0:
                 # 空页本身是模糊信号（抖音会在最后一页仍报 has_more=1），一律
                 # 尝试浏览器回补；只有确凿证据才把这一轮标成「不完整」。
@@ -210,7 +262,10 @@ class PostUserModeStrategy(BaseUserModeStrategy):
                 page_items,
                 page_number,
             )
-            limit_reached = number_limit > 0 and candidate_count >= number_limit
+            limit_reached = (self._stream_limit_reached if self._item_sink is not None
+                             else number_limit > 0 and candidate_count >= number_limit)
+            if self._stream_limit_reached:
+                return aweme_list, False
             should_stop, pagination_restricted = self._page_stop_decision(
                 has_more=has_more,
                 next_cursor=max_cursor,
@@ -273,7 +328,10 @@ class PostUserModeStrategy(BaseUserModeStrategy):
         # download_pinned=False 时置顶作品被静默丢掉，用户只看到「164 变
         # 161」；这里累计差额，收尾时一并汇报。
         self.pinned_excluded += raw_page_count - len(kept)
-        aweme_list.extend(kept)
+        if self._item_sink is not None:
+            aweme_list.extend({"aweme_id": str(item.get("aweme_id"))} for item in kept)
+        else:
+            aweme_list.extend(kept)
         self.downloader._progress_update_step("拉取作品列表", f"已抓取 {len(aweme_list)} 条")
         return raw_page_count
 

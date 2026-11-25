@@ -72,6 +72,46 @@ export function readWorks(databaseFile: string): WorkRow[] {
     }
 }
 
+export function authorWorkIds(databaseFile: string, sharedKey: string | undefined, knownIds: string[]) {
+    const ids = new Set(knownIds);
+    if (!sharedKey) return [...ids].sort();
+    const database = openDatabase(databaseFile, true);
+    try {
+        database.exec('PRAGMA busy_timeout=5000');
+        const columns = new Set((database.prepare('PRAGMA table_info(aweme)').all() as { name: string }[]).map(row => row.name));
+        const author = columns.has('author_sec_uid') ? "COALESCE(NULLIF(author_sec_uid, ''), author_id)" : 'author_id';
+        for (const row of database.prepare(`SELECT aweme_id FROM aweme WHERE ${author}=?`).all(sharedKey) as { aweme_id: string }[]) ids.add(row.aweme_id);
+        const queue = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='download_queue'").get();
+        if (queue) {
+            const prefix = `post:${sharedKey}:`;
+            for (const row of database.prepare('SELECT aweme_id FROM download_queue WHERE scope>=? AND scope<?')
+                .all(prefix, prefix + '\uffff') as { aweme_id: string }[]) ids.add(row.aweme_id);
+        }
+        return [...ids].sort();
+    } finally { database.close(); }
+}
+
+export function resetDownloadedWorks(databaseFile: string, workIds: string[]) {
+    const database = openDatabase(databaseFile);
+    try {
+        database.exec('PRAGMA busy_timeout=5000');
+        const columns = new Set((database.prepare('PRAGMA table_info(aweme)').all() as { name: string }[]).map(row => row.name));
+        const reset = ['file_path', 'download_time', 'metadata_path', 'cover_path', 'avatar_path']
+            .filter(column => columns.has(column)).map(column => `${column}=NULL`).join(', ');
+        const update = database.prepare(`UPDATE aweme SET ${reset} WHERE aweme_id=?`);
+        const queue = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='download_queue'").get();
+        const resetQueue = queue ? database.prepare("UPDATE download_queue SET status='pending', payload=?, updated_us=? WHERE aweme_id=?") : undefined;
+        database.exec('BEGIN IMMEDIATE');
+        try {
+            for (const id of workIds) {
+                update.run(id);
+                resetQueue?.run(JSON.stringify({ aweme_id: id }), Date.now() * 1000, id);
+            }
+            database.exec('COMMIT');
+        } catch (error) { database.exec('ROLLBACK'); throw error; }
+    } finally { database.close(); }
+}
+
 // Reconcile only records affected by an explicitly confirmed file deletion.
 export async function reconcileDeletedWorks(databaseFile: string, root: string, workIds: string[]) {
     const database = openDatabase(databaseFile);

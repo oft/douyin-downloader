@@ -1,10 +1,15 @@
 import asyncio
 from typing import Any, Dict, List
+from unittest.mock import AsyncMock
+
+import pytest
 
 import core.user_modes.post_strategy as post_strategy_module
 from control.queue_manager import QueueManager
+from core.api_client import DouyinAPIClient, FailedPayload, UserUnavailableError
 from core.user_downloader import UserDownloader
 from storage.file_manager import FileManager
+from utils.browser_runtime import BrowserUnavailableError
 
 _UNSET = object()
 
@@ -487,6 +492,133 @@ def test_post_strategy_keeps_collected_items_when_recovery_detail_fails(tmp_path
     items = asyncio.run(strategy.collect_items("sec_uid_x", {"aweme_count": 2}))
 
     assert [item["aweme_id"] for item in items] == ["existing"]
+
+
+@pytest.mark.parametrize("error", [UserUnavailableError("用户不存在"), BrowserUnavailableError("浏览器启动失败")])
+def test_post_strategy_preserves_unavailable_user_reason_after_argus_rejection(tmp_path, error):
+    downloader = _build_downloader(tmp_path, mode=["post"])
+    downloader.config._data["browser_fallback"]["enabled"] = True
+
+    async def rejected(*_args, **_kwargs):
+        return DouyinAPIClient._normalize_paged_response(
+            FailedPayload(FailedPayload.REJECTED, status=403), item_keys=["aweme_list"]
+        )
+
+    async def unavailable(*_args, **_kwargs):
+        raise error
+
+    downloader.api_client.get_user_post = rejected
+    downloader.api_client.collect_user_post_ids_via_browser = unavailable
+    strategy = downloader._get_mode_strategy("post")
+
+    with pytest.raises(type(error), match=str(error)) as info:
+        asyncio.run(strategy.collect_items("sec_uid_x", {"aweme_count": 1}))
+
+    assert "安全校验" not in str(info.value)
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_browser_pagination_completion_reaches_post_strategy(tmp_path, monkeypatch, complete):
+    downloader = _build_downloader(tmp_path, mode=["post"])
+    downloader.config._data["browser_fallback"]["enabled"] = True
+    downloader.api_client.prefer_browser_posts = True
+    monkeypatch.setattr(downloader, "_browser_backend_missing", lambda: False)
+    monkeypatch.setattr(downloader.api_client, "collect_user_post_ids_via_browser",
+                        AsyncMock(return_value=["first", "second"]), raising=False)
+    monkeypatch.setattr(downloader.api_client, "pop_browser_post_aweme_items",
+                        lambda: {key: _make_aweme(key) for key in ["first", "second"]}, raising=False)
+    monkeypatch.setattr(downloader.api_client, "pop_browser_post_stats",
+                        lambda: {"complete": complete, "stop_reason": "end_of_list" if complete else "idle"},
+                        raising=False)
+    steps = []
+    monkeypatch.setattr(downloader, "_progress_update_step", lambda step, detail="": steps.append(detail))
+    strategy = downloader._get_mode_strategy("post")
+    items = asyncio.run(strategy.collect_items("sec_uid_x", {"aweme_count": 500}))
+    assert len(items) == 2
+    if complete:
+        assert strategy.incomplete_reason is None  # A profile's count alone is not evidence.
+    else:
+        assert "未收到分页结束确认" in strategy.incomplete_reason
+        assert "未确认取全" in steps[-1]
+
+
+def test_browser_detail_failures_do_not_report_a_complete_listing(tmp_path, monkeypatch):
+    downloader = _build_downloader(tmp_path, mode=["post"])
+    downloader.config._data["browser_fallback"]["enabled"] = True
+    downloader.api_client.prefer_browser_posts = True
+    monkeypatch.setattr(downloader, "_browser_backend_missing", lambda: False)
+    monkeypatch.setattr(downloader.api_client, "collect_user_post_ids_via_browser",
+                        AsyncMock(return_value=["first", "missing"]), raising=False)
+    monkeypatch.setattr(downloader.api_client, "pop_browser_post_aweme_items",
+                        lambda: {"first": _make_aweme("first")}, raising=False)
+    monkeypatch.setattr(downloader.api_client, "pop_browser_post_stats",
+                        lambda: {"complete": True, "stop_reason": "end_of_list"}, raising=False)
+    monkeypatch.setattr(downloader.api_client, "get_video_detail", AsyncMock(return_value=None), raising=False)
+    strategy = downloader._get_mode_strategy("post")
+    items = asyncio.run(strategy.collect_items("sec_uid_x", {}))
+    assert len(items) == 1
+    assert "1条作品详情未能获取" in strategy.incomplete_reason
+
+
+async def test_post_api_downloads_first_page_while_next_page_is_still_loading(tmp_path, monkeypatch):
+    downloader = _build_downloader(tmp_path, mode=["post"])
+    downloader.stream_downloads = True
+    download_started = asyncio.Event()
+    listing_finished = False
+    async def posts(_uid, max_cursor=0, count=20, **_kwargs):
+        nonlocal listing_finished
+        if max_cursor == 0:
+            return {"items": [_make_aweme("first")], "has_more": True, "max_cursor": 100}
+        await asyncio.wait_for(download_started.wait(), 1)
+        listing_finished = True
+        return {"items": [_make_aweme("second")], "has_more": False, "max_cursor": 0}
+    async def download(work, *_args, **_kwargs):
+        if work["aweme_id"] == "first":
+            assert not listing_finished
+            download_started.set()
+        return {"status": "success"}
+    monkeypatch.setattr(downloader.api_client, "get_user_post", posts)
+    monkeypatch.setattr(downloader, "_process_mode_aweme", download)
+    result = await asyncio.wait_for(downloader.download({"sec_uid": "sec_uid_x"}), 2)
+    assert result.total == result.success == 2
+
+
+async def test_browser_post_downloads_before_browser_collection_returns(tmp_path, monkeypatch):
+    downloader = _build_downloader(tmp_path, mode=["post"])
+    downloader.stream_downloads = True
+    downloader.config._data["browser_fallback"]["enabled"] = True
+    downloader.api_client.prefer_browser_posts = True
+    monkeypatch.setattr(downloader, "_browser_backend_missing", lambda: False)
+    download_started = asyncio.Event()
+    async def browser(_uid, *, on_items, **_kwargs):
+        await on_items([_make_aweme("first")])
+        await asyncio.wait_for(download_started.wait(), 1)
+        await on_items([_make_aweme("second")])
+        return ["first", "second"]
+    async def download(*_args, **_kwargs):
+        download_started.set()
+        return {"status": "success"}
+    monkeypatch.setattr(downloader.api_client, "collect_user_post_ids_via_browser", browser, raising=False)
+    monkeypatch.setattr(downloader.api_client, "pop_browser_post_stats", lambda: {"complete": True}, raising=False)
+    monkeypatch.setattr(downloader, "_process_mode_aweme", download)
+    result = await asyncio.wait_for(downloader.download({"sec_uid": "sec_uid_x"}), 2)
+    assert result.total == result.success == 2
+
+
+async def test_streamed_number_limit_is_applied_after_filters_across_pages(tmp_path, monkeypatch):
+    downloader = _build_downloader(tmp_path, mode=["post"])
+    downloader.stream_downloads = True
+    downloader.config._data["number"]["post"] = 2
+    async def posts(_uid, max_cursor=0, count=20, **_kwargs):
+        if max_cursor == 0:
+            return {"items": [_make_aweme("first")], "has_more": True, "max_cursor": 1}
+        return {"items": [_make_aweme("first"), {**_make_aweme("pinned"), "is_top": 1},
+                          _make_aweme("second"), _make_aweme("third")],
+                "has_more": True, "max_cursor": 2}
+    monkeypatch.setattr(downloader.api_client, "get_user_post", posts)
+    monkeypatch.setattr(downloader, "_process_mode_aweme", AsyncMock(return_value={"status": "success"}))
+    result = await downloader.download({"sec_uid": "sec_uid_x"})
+    assert result.total == result.success == 2
 
 
 def test_post_strategy_browser_recovery_counts_filtered_media(tmp_path, monkeypatch):
