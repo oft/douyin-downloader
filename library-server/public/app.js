@@ -2,6 +2,8 @@ import { profileIdFromLink } from './profile-link.js';
 
 const byId = id => document.getElementById(id);
 const modal = byId('modal');
+const modalContent = byId('modal-content');
+const fullscreenButton = byId('modal-fullscreen');
 const results = byId('results');
 const toolbar = byId('toolbar');
 const pager = byId('pagination');
@@ -591,6 +593,18 @@ function clearModalBody() {
     byId('modal-body').replaceChildren();
 }
 
+function updateFullscreenButton() {
+    const workOpen = modal.open && modal.classList.contains('work-modal');
+    const fullscreen = document.fullscreenElement === modalContent;
+    fullscreenButton.hidden = !document.fullscreenEnabled || !workOpen;
+    fullscreenButton.textContent = fullscreen ? '退出全屏' : '全屏';
+    if (!workOpen) exitWorkFullscreen();
+}
+
+function exitWorkFullscreen() {
+    if (document.fullscreenElement === modalContent) void document.exitFullscreen().catch(() => {});
+}
+
 function openModal(title, variant) {
     byId('modal-title').textContent = title;
     byId('modal-subtitle').textContent = '';
@@ -598,11 +612,12 @@ function openModal(title, variant) {
     modal.className = variant;
     modal.scrollTop = 0;
     if (!modal.open) modal.showModal();
+    updateFullscreenButton();
     return ++modalVersion;
 }
 
 function renderPreview(work) {
-    if (work.video) return `<video class="video-player" controls playsinline preload="metadata" src="${asset(work.video)}"${work.cover ? ` poster="${asset(work.cover)}"` : ''}></video><p id="player-error" class="player-error" role="status" hidden>此视频无法播放，请检查文件或浏览器支持的格式。</p>`;
+    if (work.video) return `<video class="video-player" controls playsinline${document.fullscreenEnabled ? ' controlslist="nofullscreen"' : ''} preload="metadata" src="${asset(work.video)}"${work.cover ? ` poster="${asset(work.cover)}"` : ''}></video><p id="player-error" class="player-error" role="status" hidden>此视频无法播放，请检查文件或浏览器支持的格式。</p>`;
     if (work.images.length) {
         return `<div class="album-player"><img id="album-image" src="${asset(work.images[0])}" alt="图集第 1 张图片"></div>
             <div class="album-controls"><button type="button" class="secondary" id="album-prev" disabled>← 上一张</button><span id="album-count">1 / ${work.images.length}</span>
@@ -955,8 +970,16 @@ byId('header-action').addEventListener('click', event => {
         void showRemoval(route.authorId ? 'works' : 'authors', undefined, false, [...currentSelection()], route.authorId);
     }
 });
+fullscreenButton.addEventListener('click', () => {
+    const change = document.fullscreenElement === modalContent ? document.exitFullscreen() : modalContent.requestFullscreen();
+    void change.catch(error => showToast(`无法切换全屏：${error.message}`, true));
+});
+document.addEventListener('fullscreenchange', updateFullscreenButton);
 byId('modal-close').addEventListener('click', () => modal.close());
-modal.addEventListener('cancel', event => { if (deleting) event.preventDefault(); });
+modal.addEventListener('cancel', event => {
+    if (deleting || document.fullscreenElement === modalContent) event.preventDefault();
+    if (!deleting) exitWorkFullscreen();
+});
 modal.addEventListener('click', async event => {
     if (deleting) return;
     if (event.target === modal || event.target.closest('[data-modal-link], [data-dismiss]')) modal.close();
@@ -978,6 +1001,7 @@ modal.addEventListener('click', async event => {
 });
 modal.addEventListener('close', () => {
     if (modal.open) return;
+    updateFullscreenButton();
     modalVersion++;
     workPreview = undefined;
     clearModalBody();

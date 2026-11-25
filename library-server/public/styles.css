@@ -149,10 +149,16 @@ h1 { margin: 0 0 6px; font-size: clamp(25px, 2.6vw, 37px); letter-spacing: -.045
 #modal::backdrop { background: #162019b0; }
 .modal-header { position: sticky; z-index: 1; top: 0; display: flex; align-items: start; justify-content: space-between; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--line); background: var(--surface); }
 .modal-header h2 { font-size: 17px; line-height: 1.4; margin: 0 0 3px; overflow-wrap: anywhere; }
+.modal-controls { display: flex; flex: none; align-items: center; gap: 8px; }
 .icon-button { flex: 0 0 34px; min-height: 34px; font-size: 22px; line-height: 1; border-radius: 6px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); }
 .icon-button:hover { background: var(--accent-light); }
 #modal-body { min-height: 35px; padding: 15px 18px 19px; }
 .video-player, .album-player { display: block; width: 100%; height: min(58dvh, 530px); background: #17201a; border-radius: 7px; }
+.video-player[controlslist~="nofullscreen"]::-webkit-media-controls-fullscreen-button { display: none; }
+#modal-content:fullscreen { display: flex; flex-direction: column; background: var(--surface); }
+#modal-content:fullscreen #modal-body { display: flex; flex: 1; flex-direction: column; min-height: 0; overflow: auto; }
+#modal-content:fullscreen :is(.video-player, .album-player) { flex: 1; min-height: 0; height: auto; object-fit: contain; }
+#modal-content:fullscreen :is(.detail-meta, .details) { display: none; }
 .album-player img { width: 100%; height: 100%; object-fit: contain; }
 .album-controls, .detail-meta { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
 .album-controls { justify-content: center; font-size: 12px; color: var(--muted); }

@@ -42,11 +42,16 @@
         <nav id="pagination" class="pagination" aria-label="翻页" hidden></nav>
     </main>
     <dialog id="modal" aria-labelledby="modal-title">
-        <header class="modal-header">
-            <div id="modal-heading"><h2 id="modal-title"></h2><div id="modal-subtitle" class="summary"></div></div>
-            <button type="button" id="modal-close" class="icon-button" aria-label="关闭" autofocus>×</button>
-        </header>
-        <div id="modal-body"></div>
+        <div id="modal-content">
+            <header class="modal-header">
+                <div id="modal-heading"><h2 id="modal-title"></h2><div id="modal-subtitle" class="summary"></div></div>
+                <div class="modal-controls">
+                    <button type="button" id="modal-fullscreen" class="secondary" hidden>全屏</button>
+                    <button type="button" id="modal-close" class="icon-button" aria-label="关闭" autofocus>×</button>
+                </div>
+            </header>
+            <div id="modal-body"></div>
+        </div>
     </dialog>
     <div id="toast" role="status" hidden></div>
 </body>
