@@ -178,7 +178,7 @@ test('database catalog, media routes, refresh, and confirmed deletion', async t 
         assert.equal((await ready()).scannedAt, undefined);
     });
 
-    await t.test('orders works and authors by local download time', async () => {
+    await t.test('orders works by publish time and authors by local download time', async () => {
         const list = async <T,>(route: string) => {
             const response = await app.request(`http://localhost/api/catalog/${route}`);
             assert.equal(response.status, 200);
@@ -203,16 +203,16 @@ test('database catalog, media routes, refresh, and confirmed deletion', async t 
 
             const workIds = (items: WorkItem[]) => items.map(work => work.platformId);
             assert.deepEqual(workIds(await list<WorkItem>('works')),
-                ['sort-recent', originalVideo!.platformId, album!.platformId, 'sort-legacy']);
-            assert.deepEqual(workIds(await list<WorkItem>('works?size=1&page=2')), [originalVideo!.platformId]);
+                ['sort-legacy', album!.platformId, originalVideo!.platformId, 'sort-recent']);
+            assert.deepEqual(workIds(await list<WorkItem>('works?size=1&page=2')), [album!.platformId]);
             const authors = await list<AuthorItem>('authors');
             assert.deepEqual(authors.map(author => author.name), ['最近更新作者', '数据库作者', '旧记录作者']);
             assert.equal(authors[1]!.latest, album!.time);
             assert.deepEqual(workIds(await list<WorkItem>(`works?author=${authors[1]!.id}`)),
-                [originalVideo!.platformId, album!.platformId]);
+                [album!.platformId, originalVideo!.platformId]);
 
             setDownloadTime.run(1794000400, album!.platformId);
-            assert.deepEqual(workIds(await list<WorkItem>('works?size=1')), [album!.platformId]);
+            assert.deepEqual(workIds(await list<WorkItem>('works?size=1')), ['sort-legacy']);
             assert.equal((await list<AuthorItem>('authors?size=1'))[0]?.name, '数据库作者');
         } finally {
             database.exec("DELETE FROM aweme WHERE aweme_id IN ('sort-recent', 'sort-legacy'); UPDATE aweme SET download_time=NULL;");

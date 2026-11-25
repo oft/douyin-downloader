@@ -352,7 +352,7 @@ function assembleCatalog(root: string, copies: CatalogEntry[], assets: Map<strin
         });
     }
 
-    works.sort((a, b) => b.downloadTime - a.downloadTime || b.time.localeCompare(a.time) || a.id.localeCompare(b.id));
+    works.sort((a, b) => b.time.localeCompare(a.time) || a.id.localeCompare(b.id));
     const authors: Author[] = [...authorDrafts].map(([id, draft]) => {
         const name = draft.name || '未命名作者';
         return { id, name, aliases: [...draft.aliases].filter(alias => alias !== name).sort(collator.compare), avatar: draft.avatar,
