@@ -138,8 +138,8 @@ function getQuery(c: Context) {
     return (c.req.query('q') ?? '').trim().toLowerCase().slice(0, 200);
 }
 
-function publicAuthor({ search, sharedKey, ...author }: Catalog['authors'][number]) { return author; }
-function publicWork({ search, copies, metadataPath, ...work }: Catalog['works'][number]) { return work; }
+function publicAuthor({ search, sharedKey, downloadTime, ...author }: Catalog['authors'][number]) { return author; }
+function publicWork({ search, copies, metadataPath, downloadTime, ...work }: Catalog['works'][number]) { return work; }
 
 async function streamAsset(c: Context, root: string, relativePath: string) {
     const requested = path.join(root, ...relativePath.split('/'));

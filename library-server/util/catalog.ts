@@ -65,6 +65,7 @@ export interface Work {
     metadataPath?: string;
     title: string;
     time: string;
+    downloadTime: number;
     kind: Kind;
     authorId?: string;
     authorName?: string;
@@ -93,6 +94,7 @@ export interface Author {
     avatar?: string;
     workCount: number;
     latest: string;
+    downloadTime: number;
     issueCount: number;
     search: string;
     sharedKey?: string;
@@ -139,8 +141,10 @@ function describeWork(row: WorkRow, stem: string) {
     const time = (numericTime && Number.isFinite(numericTime.getTime())
         ? timeFormatter.format(numericTime)
         : text(row.create_time) || fallback?.[1] || '').replace(/(\d{2})\.(\d{2})\.(\d{2})$/, '$1:$2:$3');
+    const downloadTime = typeof row.download_time === 'number' && Number.isFinite(row.download_time)
+        ? Math.max(0, row.download_time) : 0;
     const title = text(row.title) || (fallback ? text(fallback[2]) : stem) || '未命名作品';
-    return { platformId: text(row.aweme_id), time, title, authorKey: text(row.author_sec_uid || row.author_id),
+    return { platformId: text(row.aweme_id), time, downloadTime, title, authorKey: text(row.author_sec_uid || row.author_id),
         authorName: text(row.author_name), metadataPath: row.metadata_path || undefined };
 }
 
@@ -338,6 +342,7 @@ function assembleCatalog(root: string, copies: CatalogEntry[], assets: Map<strin
         const workIssues = list.flatMap(item => item.copy.issues).map(item => ({ ...item, targetId: id, authorId, title: main.title }));
         issues.push(...workIssues);
         works.push({ id, platformId: main.platformId || undefined, metadataPath: main.metadataPath, title: main.title, time: main.time, kind: main.kind, authorId, authorName,
+            downloadTime: list.reduce((latest, item) => Math.max(latest, item.downloadTime), 0),
             video: main.copy.video, cover: cover ?? main.copy.images[0], images: main.copy.images,
             sources: [...new Set(list.map(item => item.copy.source))],
             copies: list.map(({ copy }) => ({ source: copy.source, path: copy.path, localPath: copy.localPath,
@@ -347,25 +352,27 @@ function assembleCatalog(root: string, copies: CatalogEntry[], assets: Map<strin
         });
     }
 
-    works.sort((a, b) => b.time.localeCompare(a.time) || a.id.localeCompare(b.id));
+    works.sort((a, b) => b.downloadTime - a.downloadTime || b.time.localeCompare(a.time) || a.id.localeCompare(b.id));
     const authors: Author[] = [...authorDrafts].map(([id, draft]) => {
         const name = draft.name || '未命名作者';
         return { id, name, aliases: [...draft.aliases].filter(alias => alias !== name).sort(collator.compare), avatar: draft.avatar,
-            workCount: 0, latest: '', issueCount: 0, search: [name, ...draft.aliases, draft.sharedKey].join(' ').toLowerCase(), sharedKey: draft.sharedKey };
+            workCount: 0, latest: '', downloadTime: 0, issueCount: 0, search: [name, ...draft.aliases, draft.sharedKey].join(' ').toLowerCase(), sharedKey: draft.sharedKey };
     });
     const authorById = new Map(authors.map(author => [author.id, author]));
     for (const work of works) {
         const author = work.authorId ? authorById.get(work.authorId) : undefined;
         if (author) {
             author.workCount++;
-            author.latest ||= work.time;
+            author.downloadTime = Math.max(author.downloadTime, work.downloadTime);
+            if (work.time.localeCompare(author.latest) > 0) author.latest = work.time;
         }
     }
     for (const entry of issues) {
         const author = entry.authorId ? authorById.get(entry.authorId) : undefined;
         if (author) author.issueCount++;
     }
-    authors.sort((a, b) => b.workCount - a.workCount || collator.compare(a.name, b.name) || a.id.localeCompare(b.id));
+    authors.sort((a, b) => b.downloadTime - a.downloadTime || b.latest.localeCompare(a.latest) ||
+        b.workCount - a.workCount || collator.compare(a.name, b.name) || a.id.localeCompare(b.id));
     issues.sort((a, b) => collator.compare(a.path, b.path) || a.code.localeCompare(b.code));
     const visibleAuthors = authors.filter(author => author.workCount > 0);
     return { root, scannedAt, authors: visibleAuthors,

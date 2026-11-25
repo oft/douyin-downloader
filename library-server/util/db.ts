@@ -22,6 +22,7 @@ export interface WorkRow {
     author_name: string | null;
     author_sec_uid: string | null;
     create_time: number | null;
+    download_time: number | null;
     file_path: string;
     image_count: number;
     metadata_path: string | null;
@@ -57,11 +58,12 @@ export function readWorks(databaseFile: string): WorkRow[] {
         ) ELSE 0 END` : '0';
         const imageCount = columns.has('image_count')
             ? `COALESCE(image_count, ${legacyImageCount})` : legacyImageCount;
+        const downloadTime = columns.has('download_time') ? 'download_time' : 'NULL AS download_time';
         const paths = ['metadata_path', 'cover_path', 'avatar_path'].map(column =>
             columns.has(column) ? column : `NULL AS ${column}`);
         return database.prepare(`
             SELECT aweme_id, aweme_type, title, author_id, author_name, author_sec_uid,
-                   create_time, file_path, ${imageCount} AS image_count, ${paths.join(', ')}
+                   create_time, ${downloadTime}, file_path, ${imageCount} AS image_count, ${paths.join(', ')}
             FROM aweme WHERE COALESCE(file_path, '') != ''
             ORDER BY create_time DESC, aweme_id
         `).all() as unknown as WorkRow[];

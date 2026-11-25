@@ -178,6 +178,48 @@ test('database catalog, media routes, refresh, and confirmed deletion', async t 
         assert.equal((await ready()).scannedAt, undefined);
     });
 
+    await t.test('orders works and authors by local download time', async () => {
+        const list = async <T,>(route: string) => {
+            const response = await app.request(`http://localhost/api/catalog/${route}`);
+            assert.equal(response.status, 200);
+            return (await response.json() as { items: T[] }).items;
+        };
+        type WorkItem = { platformId: string; title: string; time: string };
+        type AuthorItem = { id: string; name: string; latest: string };
+        const [album, originalVideo] = await list<WorkItem>('works');
+        assert.deepEqual([album!.title, originalVideo!.title], ['数据库图集', '数据库视频']);
+
+        const database = new DatabaseSync(databaseFile);
+        try {
+            database.exec('ALTER TABLE aweme ADD COLUMN download_time INTEGER');
+            const setDownloadTime = database.prepare('UPDATE aweme SET download_time=? WHERE aweme_id=?');
+            setDownloadTime.run(1794000200, originalVideo!.platformId);
+            setDownloadTime.run(1794000100, album!.platformId);
+            const add = database.prepare(`INSERT INTO aweme
+                (aweme_id, aweme_type, title, author_id, author_name, create_time, download_time, file_path)
+                VALUES (?, 'video', ?, ?, ?, ?, ?, ?)`);
+            add.run('sort-recent', '最近补下载的旧视频', 'recent-author', '最近更新作者', 1793000000, 1794000300, 'unregistered.mp4');
+            add.run('sort-legacy', '缺少下载时间的视频', 'legacy-author', '旧记录作者', 1793700000, null, 'legacy-sort.mp4');
+
+            const workIds = (items: WorkItem[]) => items.map(work => work.platformId);
+            assert.deepEqual(workIds(await list<WorkItem>('works')),
+                ['sort-recent', originalVideo!.platformId, album!.platformId, 'sort-legacy']);
+            assert.deepEqual(workIds(await list<WorkItem>('works?size=1&page=2')), [originalVideo!.platformId]);
+            const authors = await list<AuthorItem>('authors');
+            assert.deepEqual(authors.map(author => author.name), ['最近更新作者', '数据库作者', '旧记录作者']);
+            assert.equal(authors[1]!.latest, album!.time);
+            assert.deepEqual(workIds(await list<WorkItem>(`works?author=${authors[1]!.id}`)),
+                [originalVideo!.platformId, album!.platformId]);
+
+            setDownloadTime.run(1794000400, album!.platformId);
+            assert.deepEqual(workIds(await list<WorkItem>('works?size=1')), [album!.platformId]);
+            assert.equal((await list<AuthorItem>('authors?size=1'))[0]?.name, '数据库作者');
+        } finally {
+            database.exec("DELETE FROM aweme WHERE aweme_id IN ('sort-recent', 'sort-legacy'); UPDATE aweme SET download_time=NULL;");
+            database.close();
+        }
+    });
+
     await t.test('links resolve directly to the same internal author page', async () => {
         const matches = await app.request('http://localhost/api/catalog/link-authors');
         assert.equal(matches.status, 200);
