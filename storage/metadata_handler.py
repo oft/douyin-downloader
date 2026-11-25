@@ -1,8 +1,11 @@
 import asyncio
 import json
+import os
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
+from uuid import uuid4
 
 import aiofiles
 
@@ -16,13 +19,18 @@ class MetadataHandler:
         self._manifest_lock = asyncio.Lock()
 
     async def save_metadata(self, data: Dict[str, Any], save_path: Path) -> bool:
+        temporary = save_path.parent / (".metadata-" + uuid4().hex + ".tmp")
         try:
-            async with aiofiles.open(save_path, "w", encoding="utf-8") as f:
+            async with aiofiles.open(temporary, "x", encoding="utf-8") as f:
                 await f.write(json.dumps(data, ensure_ascii=False, indent=2))
+            await asyncio.to_thread(os.replace, temporary, save_path)
             return True
         except Exception as e:
             logger.error("Failed to save metadata: %s, error: %s", save_path, e)
             return False
+        finally:
+            with suppress(OSError):
+                await asyncio.to_thread(temporary.unlink, missing_ok=True)
 
     async def append_download_manifest(self, base_path: Path, record: Dict[str, Any]) -> bool:
         manifest_path = base_path / "download_manifest.jsonl"

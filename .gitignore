@@ -51,3 +51,6 @@ config/cookies.json
 .vscode/
 .omc/
 .gstack/
+
+*.db-wal
+*.db-shm

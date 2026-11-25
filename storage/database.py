@@ -6,6 +6,8 @@ from urllib.parse import urlparse
 
 import aiosqlite
 
+from .metadata_files import prepare_aweme_record
+
 
 def order_cover_mirrors(urls: List[Any]) -> List[str]:
     """封面镜像排序:p3-* 域名 403 概率高,置后;保序截断 3 个。
@@ -52,8 +54,9 @@ def _cover_urls_from_metadata(metadata: str) -> str:
 
 
 class Database:
-    def __init__(self, db_path: str = "dy_downloader.db"):
+    def __init__(self, db_path: str = "dy_downloader.db", download_root: Optional[str] = None):
         self.db_path = db_path
+        self.download_root = download_root
         self._initialized = False
         self._conn: Optional[aiosqlite.Connection] = None
         # 延迟到首次 _get_conn 调用时在当前 event loop 上创建 Lock，
@@ -224,6 +227,14 @@ class Database:
                 "ALTER TABLE aweme ADD COLUMN job_id TEXT NOT NULL DEFAULT ''"
             )
 
+        for column, declaration in (
+            ("image_count", "INTEGER"),
+            ("metadata_path", "TEXT"),
+            ("cover_path", "TEXT"),
+            ("avatar_path", "TEXT"),
+        ):
+            if column not in existing_columns:
+                await db.execute("ALTER TABLE aweme ADD COLUMN " + column + " " + declaration)
         await db.commit()
         self._initialized = True
 
@@ -244,13 +255,14 @@ class Database:
     # Preserving upsert: metadata-ish fields always update, but download
     # artifacts (file_path / metadata / download_time) and enrichments
     # (cover_urls / job_id) survive upserts that arrive without them.
-    # Kept identical to the desktop sibling (its my-content sync writes
-    # empty projections that must not clobber downloaded rows).
+    # Empty projections preserve download artifacts. Externalized details
+    # clear the legacy blob only after a metadata file has been saved.
     _AWEME_UPSERT_SQL = """
         INSERT INTO aweme
         (aweme_id, aweme_type, title, author_id, author_name, author_sec_uid,
-         create_time, download_time, file_path, metadata, cover_urls, job_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         create_time, download_time, file_path, metadata, cover_urls, job_id,
+         image_count, metadata_path, cover_path, avatar_path)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(aweme_id) DO UPDATE SET
           aweme_type = CASE WHEN COALESCE(excluded.aweme_type, '') != ''
                             THEN excluded.aweme_type
@@ -276,7 +288,9 @@ class Database:
           file_path = CASE WHEN COALESCE(excluded.file_path, '') != ''
                            THEN excluded.file_path
                            ELSE aweme.file_path END,
-          metadata = CASE WHEN COALESCE(excluded.metadata, '') != ''
+          metadata = CASE WHEN COALESCE(excluded.metadata_path, '') != ''
+                          THEN NULL
+                          WHEN COALESCE(excluded.metadata, '') != ''
                           THEN excluded.metadata
                           ELSE aweme.metadata END,
           cover_urls = CASE WHEN excluded.cover_urls != '' AND excluded.cover_urls != '[]'
@@ -284,7 +298,11 @@ class Database:
                             ELSE aweme.cover_urls END,
           job_id = CASE WHEN excluded.job_id != ''
                         THEN excluded.job_id
-                        ELSE aweme.job_id END
+                        ELSE aweme.job_id END,
+          image_count = COALESCE(excluded.image_count, aweme.image_count),
+          metadata_path = COALESCE(NULLIF(excluded.metadata_path, ''), aweme.metadata_path),
+          cover_path = COALESCE(NULLIF(excluded.cover_path, ''), aweme.cover_path),
+          avatar_path = COALESCE(NULLIF(excluded.avatar_path, ''), aweme.avatar_path)
     """
 
     @staticmethod
@@ -305,6 +323,10 @@ class Database:
             item.get("metadata"),
             item.get("cover_urls") or "",
             item.get("job_id") or "",
+            item.get("image_count"),
+            item.get("metadata_path"),
+            item.get("cover_path"),
+            item.get("avatar_path"),
         )
 
     async def add_aweme(
@@ -313,6 +335,7 @@ class Database:
         *,
         author_sec_uid: Optional[str] = None,
     ):
+        aweme_data = await prepare_aweme_record(aweme_data, self.download_root)
         db = await self._get_conn()
         # Prefer the explicit kwarg; fall back to a key on the payload so existing
         # callers (tests, legacy downloaders) keep working.
@@ -330,9 +353,10 @@ class Database:
             return
         db = await self._get_conn()
         now_ts = int(datetime.now().timestamp())
+        prepared = [await prepare_aweme_record(item, self.download_root) for item in items]
         rows = [
             self._aweme_upsert_row(item, item.get("author_sec_uid"), now_ts)
-            for item in items
+            for item in prepared
         ]
         await db.executemany(self._AWEME_UPSERT_SQL, rows)
         await db.commit()
@@ -431,7 +455,8 @@ class Database:
         offset = max(0, (page - 1) * size)
         cursor = await db.execute(
             f"SELECT aweme_id, aweme_type, title, author_id, author_name, "
-            f"author_sec_uid, create_time, download_time, file_path, cover_urls, job_id "
+            f"author_sec_uid, create_time, download_time, file_path, cover_urls, job_id, "
+            f"image_count, metadata_path, cover_path, avatar_path "
             f"FROM aweme {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
             params + [int(size), int(offset)],
         )
@@ -461,6 +486,10 @@ class Database:
                 "file_path": r[8],
                 "cover_urls": _parse_covers(r[9]),
                 "job_id": r[10] or "",
+                "image_count": r[11],
+                "metadata_path": r[12],
+                "cover_path": r[13],
+                "avatar_path": r[14],
             }
             for r in rows
         ]

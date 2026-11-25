@@ -1,0 +1,25 @@
+{
+  "name": "dy-server",
+  "module": "index.ts",
+  "type": "module",
+  "scripts": {
+    "start": "node index.ts",
+    "check": "tsc --noEmit",
+    "test": "node --test tests/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.12.2",
+    "express": "^4.21.0",
+    "hono": "^4.5.11",
+    "yaml": "^2.9.1"
+  },
+  "packageManager": "bun@1.1.26"
+}

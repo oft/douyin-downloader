@@ -105,3 +105,7 @@ A Python-based Douyin (TikTok China) batch downloader that fetches videos, galle
 - Use `dev` for this fork's development and integration work.
 - When incorporating upstream updates, run `git fetch upstream`, switch to `dev`, and merge `upstream/main`. Resolve conflicts while preserving the CLI browser login fix, then validate and push `dev` to `origin`.
 - The CLI intentionally keeps configured login cookies in its browser fallback. This behavior is maintained in `cli/main.py` and covered by `tests/test_cli_main.py`.
+
+- This fork intentionally stores full work metadata in JSON files and compact image/path fields in SQLite. Changes in storage/database.py, storage/metadata_files.py and storage/metadata_handler.py diverge from the desktop sibling for this storage model.
+
+- Stored work file paths are relative to the configured download root. Pass download_root when constructing Database in download entry points. The library reads the downloader YAML configuration to resolve these paths.

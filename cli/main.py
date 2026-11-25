@@ -290,7 +290,7 @@ async def main_async(args):
     database = None
     if config.get("database"):
         db_path = config.get("database_path", "dy_downloader.db") or "dy_downloader.db"
-        database = Database(db_path=str(db_path))
+        database = Database(db_path=str(db_path), download_root=config.get("path"))
         await database.initialize()
         display.print_success("Database initialized")
     await _recover_live_recordings(database, config)

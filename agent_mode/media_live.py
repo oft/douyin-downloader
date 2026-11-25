@@ -267,7 +267,7 @@ async def record_live(args: argparse.Namespace) -> Dict[str, Any]:
     # update 对 dict 值是合并，其余直播参数保持默认
     config.update(live={"max_duration_seconds": args.max_duration})
     state.ensure_state_dir()
-    database = Database(db_path=str(state.history_db_path()))
+    database = Database(db_path=str(state.history_db_path()), download_root=config.get("path"))
     await database.initialize()
     try:
         await recover_interrupted(database, config)
