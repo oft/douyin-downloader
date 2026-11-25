@@ -21,7 +21,9 @@ const jsonHeaders = { 'Content-Type': 'application/json' };
 let status = {};
 let route;
 let listVersion = 0;
+let workListPage;
 let modalVersion = 0;
+let workPreview;
 let searchTimer;
 let scanTimer;
 let scanStatusVersion = 0;
@@ -29,6 +31,8 @@ let toastTimer;
 let issueById = new Map();
 let deleting = false;
 const selectedAuthors = new Set();
+const selectedWorks = new Set();
+let selectionAuthorId;
 let linkConfig;
 let linkAuthors = {};
 let linkDraft = [];
@@ -67,7 +71,7 @@ function readRoute() {
         params: new URLSearchParams(query) };
 }
 
-function setParams(changes, { replace = false } = {}) {
+function setParams(changes, { replace = false, workPage } = {}) {
     const params = new URLSearchParams(route.params);
     for (const [key, value] of Object.entries(changes)) {
         if (value != null && value !== '' && !(key === 'page' && Number(value) === 1)) params.set(key, value);
@@ -78,7 +82,7 @@ function setParams(changes, { replace = false } = {}) {
     if (replace) {
         history.replaceState(null, '', next);
         route = readRoute();
-        void loadList();
+        void loadList({ workPage });
     } else location.hash = next;
 }
 
@@ -100,12 +104,13 @@ function renderToolbar() {
         filters = select('status', '状态', issueViews, 'pending') + select('code', '类型', { '': '全部类型', ...issueNames });
     } else if (view === 'works' || authorId) {
         filters = select('kind', '类型', { '': '全部类型', ...kindNames }) + select('source', '来源', { '': '全部来源', ...sourceNames });
-    } else if (view === 'authors') {
+    }
+    if (view === 'authors') {
         const list = params.get('layout') === 'list';
-        filters = `<div class="author-layout" role="group" aria-label="作者展示方式">
-            <button class="secondary" type="button" data-author-layout="cards" aria-pressed="${!list}">卡片</button>
-            <button class="secondary" type="button" data-author-layout="list" aria-pressed="${list}">列表</button>
-        </div><label class="author-select-page"><input id="select-author-page" type="checkbox" disabled>全选本页</label>`;
+        filters += `<div class="view-layout" role="group" aria-label="${authorId ? '作品' : '作者'}展示方式">
+            <button class="secondary" type="button" data-view-layout="cards" aria-pressed="${!list}">卡片</button>
+            <button class="secondary" type="button" data-view-layout="list" aria-pressed="${list}">列表</button>
+        </div><label class="select-page"><input id="select-page" type="checkbox" disabled>全选本页</label>`;
     }
     toolbar.innerHTML = `<label class="search"><span aria-hidden="true">⌕</span><input id="search" type="search" maxlength="200" value="${escape(params.get('q') ?? '')}" placeholder="${placeholder}" aria-label="${placeholder}"></label><div class="filters">${filters}</div>`;
     byId('search').addEventListener('input', event => {
@@ -118,42 +123,58 @@ function renderToolbar() {
     }
 }
 
-function updateAuthorSelection() {
-    const selectPage = byId('select-author-page');
-    const remove = byId('batch-delete-authors');
+function currentSelection() {
+    return route.authorId ? selectedWorks : selectedAuthors;
+}
+
+function selectionActions() {
+    return `<button id="clear-selection" class="plain" type="button" hidden>清空选择</button>
+        <button id="batch-delete-selection" class="secondary danger" type="button" disabled>${route.authorId ? '批量删除作品' : '批量删除'}</button>`;
+}
+
+function updateSelection() {
+    const selectPage = byId('select-page');
+    const remove = byId('batch-delete-selection');
     if (!selectPage || !remove) return;
-    const boxes = [...results.querySelectorAll('input[data-select-author]')];
+    const selected = currentSelection();
+    const boxes = [...results.querySelectorAll('input[data-select-entry]')];
     let checked = 0;
     for (const box of boxes) {
-        box.checked = selectedAuthors.has(box.value);
+        box.checked = selected.has(box.value);
         if (box.checked) checked++;
     }
     selectPage.disabled = !boxes.length;
     selectPage.checked = boxes.length > 0 && checked === boxes.length;
     selectPage.indeterminate = checked > 0 && checked < boxes.length;
-    byId('clear-author-selection').hidden = !selectedAuthors.size;
-    remove.disabled = !selectedAuthors.size;
-    remove.textContent = selectedAuthors.size ? `批量删除（${number.format(selectedAuthors.size)}）` : '批量删除';
+    byId('clear-selection').hidden = !selected.size;
+    remove.disabled = !selected.size;
+    const label = route.authorId ? '批量删除作品' : '批量删除';
+    remove.textContent = selected.size ? `${label}（${number.format(selected.size)}）` : label;
 }
 
 function box(title, description, extra = '') {
     return `<div class="empty"><h2>${escape(title)}</h2><p>${escape(description)}</p>${extra}</div>`;
 }
 
-function workCard(work) {
+function entryCheckbox(id, name) {
+    return `<label class="entry-check"><input type="checkbox" data-select-entry value="${escape(id)}" aria-label="选择 ${escape(name)}"></label>`;
+}
+
+function workCard(work, list, selectable) {
     const label = kindNames[work.kind] ?? '作品';
+    const media = `${label}${work.kind === 'album' && work.images.length ? ` · ${work.images.length} 张` : ''}`;
     const thumb = work.cover ? `<img src="${asset(work.cover)}" alt="" loading="lazy" decoding="async">` : '';
     const source = work.sources.map(value => sourceNames[value] ?? value).join(' · ');
     const author = work.authorId ? `<a href="${authorLink(work.authorId)}">${escape(work.authorName ?? '未命名作者')}</a>` : '<span>作者未知</span>';
-    return `<article class="work-card">
+    return `<article class="work-card">${selectable ? entryCheckbox(work.id, work.title) : ''}
         <button class="thumb ${work.cover ? 'has-image' : ''}" data-work="${escape(work.id)}" type="button" aria-label="预览 ${escape(work.title)}">
             <span class="thumb-placeholder" aria-hidden="true">${work.kind === 'album' ? '▧' : '▷'}</span>${thumb}
-            <span class="media-badge">${label}${work.kind === 'album' && work.images.length ? ` · ${work.images.length} 张` : ''}</span>
+            ${list ? '' : `<span class="media-badge">${media}</span>`}
         </button>
         <div class="work-info">
             <button type="button" class="work-title" data-work="${escape(work.id)}" title="${escape(work.title)}">${escape(work.title)}</button>
-            <div class="work-author">${author}</div>
-            <div class="work-foot"><time>${escape(work.time ? work.time.slice(0, 10) : '日期未知')}</time><span>${escape(source)}</span></div>
+            ${list ? '' : `<div class="work-author">${author}</div>`}
+            <div class="work-foot">${list ? `<span>${media}</span>` : ''}<time>${escape(work.time ? work.time.slice(0, 10) : '日期未知')}</time><span>${escape(source)}</span></div>
         </div>
     </article>`;
 }
@@ -162,8 +183,7 @@ function authorCard(author, list) {
     const avatar = author.avatar ? `<img src="${asset(author.avatar)}" alt="" loading="lazy" decoding="async">` : '';
     const initial = Array.from(author.name)[0] ?? '◎';
     const count = `<span class="author-count">${number.format(author.workCount)} 件作品</span>`;
-    return `<article class="author-entry"><label class="author-check"><input type="checkbox" data-select-author
-        value="${escape(author.id)}" aria-label="选择 ${escape(author.name)}"></label>
+    return `<article class="author-entry">${entryCheckbox(author.id, author.name)}
         <a class="author-card" href="${authorLink(author.id)}"><span class="avatar"><span aria-hidden="true">${escape(initial)}</span>${avatar}</span><span class="author-card-info">
         <strong>${escape(author.name)}</strong>${list ? '' : count}${author.aliases.length ? `<small>曾用名 ${escape(author.aliases.join('、'))}</small>` : ''}</span>
         ${list ? count : ''}<span class="author-arrow" aria-hidden="true">›</span></a></article>`;
@@ -188,7 +208,7 @@ function renderPager(data) {
         <button class="secondary" type="button" data-page="${data.page + 1}" ${data.page === data.pages ? 'disabled' : ''}>下一页 →</button>`;
 }
 
-async function loadList({ showLoading = false } = {}) {
+async function loadList({ showLoading = false, workPage } = {}) {
     const version = ++listVersion;
     const current = route;
     const { view, authorId } = current;
@@ -201,17 +221,19 @@ async function loadList({ showLoading = false } = {}) {
     if (showLoading) {
         results.innerHTML = '<div class="empty"><span class="spinner" aria-hidden="true"></span><p>正在读取…</p></div>';
         pager.hidden = true;
-        if (endpoint === 'authors') updateAuthorSelection();
+        if (view === 'authors') updateSelection();
     }
     results.setAttribute('aria-busy', 'true');
     try {
-        const [data, author] = await Promise.all([api(`${endpoint}?${params}`), authorPage ? api(`authors/${encodeURIComponent(authorId)}`) : null]);
+        const [data, author] = workPage ? [workPage.data, workPage.author]
+            : await Promise.all([api(`${endpoint}?${params}`), authorPage ? api(`authors/${encodeURIComponent(authorId)}`) : null]);
         if (version !== listVersion) return;
+        workListPage = endpoint === 'works' ? { data, params, author, route: current } : undefined;
         if (author) {
             byId('heading').textContent = author.name;
             const issueAction = author.issueCount ? `<a class="secondary" href="${issueLink('author', author.id)}">查看作者异常</a>` : '';
             byId('header-action').innerHTML = `${issueAction}<button class="secondary" type="button" data-remove-author-links="${escape(author.id)}">删除链接</button>
-                <button class="secondary danger" type="button" data-remove-author="${escape(author.id)}">删除作者</button>`;
+                <button class="secondary danger" type="button" data-remove-author="${escape(author.id)}">删除作者</button>${selectionActions()}`;
         }
         let summary = `共 ${number.format(data.total)} ${endpoint === 'authors' ? '位作者' : endpoint === 'issues' ? '条异常记录' : '件作品'}`;
         if (author?.aliases.length) summary += `　·　曾用名 ${author.aliases.join('、')}`;
@@ -229,17 +251,19 @@ async function loadList({ showLoading = false } = {}) {
         } else if (endpoint === 'authors') {
             const list = params.get('layout') === 'list';
             results.innerHTML = `<div class="${list ? 'author-list' : 'author-grid'}">${data.items.map(item => authorCard(item, list)).join('')}</div>`;
+        } else if (endpoint === 'works') {
+            const list = authorPage && params.get('layout') === 'list';
+            results.innerHTML = `<div class="${list ? 'work-list' : 'work-grid'}">${data.items.map(work => workCard(work, list, authorPage)).join('')}</div>`;
         } else {
-            const [className, render] = endpoint === 'works' ? ['work-grid', workCard] : ['issue-list', issueCard];
-            results.innerHTML = `<div class="${className}">${data.items.map(render).join('')}</div>`;
+            results.innerHTML = `<div class="issue-list">${data.items.map(issueCard).join('')}</div>`;
         }
-        if (endpoint === 'authors') updateAuthorSelection();
+        if (view === 'authors') updateSelection();
         renderPager(data);
     } catch (error) {
         if (version !== listVersion) return;
         results.innerHTML = box('读取失败', error.message, '<button type="button" class="secondary" data-retry>重试</button>');
         pager.hidden = true;
-        if (endpoint === 'authors') updateAuthorSelection();
+        if (view === 'authors') updateSelection();
     } finally {
         if (version === listVersion) results.setAttribute('aria-busy', 'false');
     }
@@ -397,8 +421,13 @@ function navigate() {
     clearTimeout(searchTimer);
     if (modal.open) modal.close();
     ++listVersion;
+    workListPage = undefined;
     route = readRoute();
     const { view, authorId } = route;
+    if (authorId && selectionAuthorId !== authorId) {
+        selectedWorks.clear();
+        selectionAuthorId = authorId;
+    }
     for (const link of document.querySelectorAll('[data-view]')) {
         if (link.dataset.view === view) link.setAttribute('aria-current', 'page');
         else link.removeAttribute('aria-current');
@@ -414,7 +443,7 @@ function navigate() {
     } else {
         renderToolbar();
         if (view === 'authors' && !authorId) {
-            byId('header-action').innerHTML = '<button id="clear-author-selection" class="plain" type="button" hidden>清空选择</button><button id="batch-delete-authors" class="secondary danger" type="button" disabled>批量删除</button>';
+            byId('header-action').innerHTML = selectionActions();
         }
         if (view === 'issues' && !status.scannedAt) {
             results.setAttribute('aria-busy', 'true');
@@ -505,8 +534,9 @@ function renderPreview(work) {
     return box('没有可预览的本地媒体', '可以在异常记录中查看文件检查结果。');
 }
 
-async function showWork(id) {
+async function showWork(id, listPage) {
     const version = openModal('正在读取作品…', 'work-modal');
+    workPreview = { id, listPage, loadingPage: false };
     try {
         const work = await api(`works/${encodeURIComponent(id)}`);
         if (version !== modalVersion || !modal.open) return;
@@ -515,7 +545,7 @@ async function showWork(id) {
         const copies = work.copies.map(copy => `<li><div><strong>${sourceNames[copy.source] ?? escape(copy.source)}</strong><code class="path">${escape(copy.localPath)}</code></div><button type="button" class="plain" data-copy="${escape(copy.localPath)}">复制路径</button></li>`).join('');
         const author = work.authorId ? `<a class="secondary" href="${authorLink(work.authorId)}" data-modal-link>${escape(work.authorName ?? '查看作者')} →</a>` : '';
         const issues = work.issueCount ? `<a class="secondary" href="#issues?${new URLSearchParams({ target: work.id, status: 'all' })}" data-modal-link>查看异常（${work.issueCount}）</a>` : '';
-        const actions = `<div class="work-actions"><button class="secondary" type="button" data-files="${escape(work.id)}">文件清单</button><button class="secondary danger" type="button" data-remove-work="${escape(work.id)}">删除作品</button></div>`;
+        const actions = `<div class="work-actions"><button class="secondary" type="button" data-files="${escape(work.id)}">文件清单</button><button class="secondary danger" type="button" data-remove-work="${escape(work.id)}" aria-keyshortcuts="Delete">删除作品</button></div>`;
         byId('modal-body').innerHTML = `${actions}${renderPreview(work)}<div class="detail-meta">${author}${issues}</div><section class="details"><h3>本地副本（${work.copies.length}）</h3><ul>${copies}</ul></section>`;
         const video = modal.querySelector('video');
         if (video) {
@@ -544,6 +574,43 @@ async function showWork(id) {
         }
     } catch (error) {
         if (version === modalVersion && modal.open) byId('modal-body').innerHTML = box('作品无法打开', error.message);
+    }
+}
+
+async function stepWorkPreview(step) {
+    const preview = workPreview;
+    if (!preview?.listPage || preview.loadingPage) return;
+    const { data, params } = preview.listPage;
+    const index = data.items.findIndex(work => work.id === preview.id);
+    if (index < 0) return;
+    const adjacent = data.items[index + step];
+    if (adjacent) {
+        void showWork(adjacent.id, preview.listPage);
+        return;
+    }
+
+    const page = data.page + step;
+    if (page < 1 || page > data.pages) return;
+    const version = modalVersion;
+    const hash = location.hash;
+    const nextParams = new URLSearchParams(params);
+    nextParams.set('page', page);
+    preview.loadingPage = true;
+    try {
+        const next = await api(`works?${nextParams}`);
+        if (version !== modalVersion || !modal.open || location.hash !== hash || next.page !== page) return;
+        const work = next.items.at(step > 0 ? 0 : -1);
+        if (!work || work.id === preview.id) return;
+        const nextListPage = { ...preview.listPage, data: next, params: nextParams };
+        if (route === nextListPage.route) {
+            setParams({ page }, { replace: true, workPage: nextListPage });
+            nextListPage.route = route;
+        }
+        void showWork(work.id, nextListPage);
+    } catch (error) {
+        if (version === modalVersion && modal.open) showToast(`无法切换作品：${error.message}`, true);
+    } finally {
+        preview.loadingPage = false;
     }
 }
 
@@ -627,11 +694,13 @@ async function showAuthorLinkRemoval(id) {
     }
 }
 
-async function showRemoval(kind, id, showFiles = false, batchIds = []) {
+async function showRemoval(kind, id, showFiles = false, batchIds = [], batchAuthorId) {
     const isAuthor = kind === 'authors';
     const batch = batchIds.length > 0;
-    const title = batch ? '批量删除作者' : isAuthor ? '删除作者' : showFiles ? '作品文件清单' : '删除作品';
-    const endpoint = batch ? 'authors/batch-removal' : `${kind}/${encodeURIComponent(id)}`;
+    const subject = isAuthor ? '作者' : '作品';
+    const title = batch ? `批量删除${subject}` : showFiles ? '作品文件清单' : `删除${subject}`;
+    const endpoint = batch ? isAuthor ? 'authors/batch-removal' : `authors/${encodeURIComponent(batchAuthorId)}/works/batch-removal`
+        : `${kind}/${encodeURIComponent(id)}`;
     const version = openModal(title, 'remove-modal');
     const body = byId('modal-body');
     body.innerHTML = '<div class="empty"><span class="spinner" aria-hidden="true"></span><p>正在读取文件…</p></div>';
@@ -639,16 +708,16 @@ async function showRemoval(kind, id, showFiles = false, batchIds = []) {
         const plan = batch ? await api(endpoint, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ ids: batchIds }) })
             : await api(`${endpoint}/${isAuthor ? 'removal' : 'files'}`);
         if (version !== modalVersion || !modal.open) return;
-        byId('modal-subtitle').textContent = batch ? `已选 ${number.format(plan.authors.length)} 位作者` : plan.title;
+        byId('modal-subtitle').textContent = batch ? `已选 ${number.format(isAuthor ? plan.authors.length : plan.workCount)} ${isAuthor ? '位作者' : '件作品'}` : plan.title;
         const summary = `${number.format(plan.workCount)} 件作品 · ${number.format(plan.copyCount)} 个副本 · ${number.format(plan.fileCount)} 个文件 · ${formatSize(plan.size)}`;
         const authorWorks = plan.works?.map(work => `<li><span>${escape(work.title)}</span><small>${number.format(work.copyCount)} 个副本</small></li>`).join('');
-        const authors = batch ? `<details class="file-copy" open><summary><strong>所选作者</strong></summary><ul class="removal-works">${plan.authors.map(author => `<li><span>${escape(author.name)}</span><small>${number.format(author.workCount)} 件作品</small></li>`).join('')}</ul></details>` : '';
-        const listing = isAuthor && authorWorks ? `<details class="file-copy" ${batch ? '' : 'open'}><summary><strong>受影响的作品</strong></summary><ul class="removal-works">${authorWorks}</ul>${plan.workCount > plan.works.length ? `<p class="summary more-works">此处显示前 ${plan.works.length} 件，全部 ${number.format(plan.workCount)} 件都在删除范围内。</p>` : ''}</details>`
+        const authors = batch && isAuthor ? `<details class="file-copy" open><summary><strong>所选作者</strong></summary><ul class="removal-works">${plan.authors.map(author => `<li><span>${escape(author.name)}</span><small>${number.format(author.workCount)} 件作品</small></li>`).join('')}</ul></details>` : '';
+        const listing = (isAuthor || batch) && authorWorks ? `<details class="file-copy" ${authors ? '' : 'open'}><summary><strong>受影响的作品</strong></summary><ul class="removal-works">${authorWorks}</ul>${plan.workCount > plan.works.length ? `<p class="summary more-works">此处显示前 ${plan.works.length} 件，全部 ${number.format(plan.workCount)} 件都在删除范围内。</p>` : ''}</details>`
             : (plan.copies ?? []).map(fileList).join('');
         const scope = isAuthor ? `${batch ? '所选作者' : '此作者'}的全部本地作品副本和对应数据库记录将永久删除，同时移除配置中匹配的 ${number.format(plan.removedLinks ?? 0)} 条作者主页链接。删除后无法从资料库恢复。`
-            : '此作品的全部本地副本将永久删除。平铺文件按清单删除。删除后无法从资料库恢复。';
+            : `${batch ? '所选作品' : '此作品'}的本地副本和对应数据库记录将永久删除。平铺文件按清单删除。删除后无法从资料库恢复。`;
         const errors = plan.errors.length ? `<div class="player-error" role="alert">清单无法完整读取，请检查目录后刷新数据库。<ul>${plan.errors.slice(0, 5).map(error => `<li>${escape(error)}</li>`).join('')}</ul></div>` : '';
-        const back = isAuthor ? '<button class="secondary" type="button" data-dismiss>取消</button>' : `<button class="secondary" type="button" data-work-back="${escape(id)}">返回作品</button>`;
+        const back = isAuthor || batch ? '<button class="secondary" type="button" data-dismiss>取消</button>' : `<button class="secondary" type="button" data-work-back="${escape(id)}">返回作品</button>`;
         body.innerHTML = `<p class="removal-count">${summary}</p>${authors}${listing}<p class="summary removal-scope">${scope}</p>${errors}
             <p id="removal-error" class="player-error" role="alert" hidden></p><div class="form-actions">${back}<button id="confirm-removal" class="primary danger" type="button" ${plan.token ? '' : 'disabled'}>永久删除</button></div>`;
         byId('confirm-removal').addEventListener('click', async () => {
@@ -661,8 +730,9 @@ async function showRemoval(kind, id, showFiles = false, batchIds = []) {
                 const result = await api(endpoint, { method: 'DELETE', headers: jsonHeaders,
                     body: JSON.stringify({ mode: 'permanent', token: plan.token, ids: batch ? batchIds : undefined }) });
                 if (isAuthor && !linksChanged()) linkConfig = undefined;
-                if (isAuthor) for (const selected of batch ? batchIds : [id]) selectedAuthors.delete(selected);
-                updateAuthorSelection();
+                const selection = isAuthor ? selectedAuthors : selectedWorks;
+                for (const selected of batch ? batchIds : [id]) selection.delete(selected);
+                updateSelection();
                 const showReceipt = version === modalVersion && modal.open;
                 ++scanStatusVersion;
                 clearTimeout(scanTimer);
@@ -674,7 +744,7 @@ async function showRemoval(kind, id, showFiles = false, batchIds = []) {
                 } else if (route.view === 'issues' && !status.scannedAt) void refreshStatus({ rescan: true });
                 else void loadList();
                 if (showReceipt) {
-                    openModal(batch ? `已删除 ${number.format(batchIds.length)} 位作者` : isAuthor ? '已删除作者' : '已删除作品', 'review-modal');
+                    openModal(batch ? `已删除 ${number.format(batchIds.length)} ${isAuthor ? '位作者' : '件作品'}` : `已删除${subject}`, 'review-modal');
                     const scanWarning = result.databaseError ? '<p class="player-error">无法读取更新后的数据库，请刷新页面。</p>' : '';
                     body.innerHTML = `<p class="summary">已永久删除 ${number.format(result.deletedFiles)} 个文件和 ${number.format(result.deletedDirectories)} 个目录。${isAuthor ? `已移除 ${number.format(result.removedLinks ?? 0)} 条作者主页链接。` : ''}</p>${scanWarning}<div class="form-actions"><button class="secondary" type="button" data-dismiss>完成</button></div>`;
                 } else showToast('永久删除已完成');
@@ -688,7 +758,7 @@ async function showRemoval(kind, id, showFiles = false, batchIds = []) {
                     retry.type = 'button';
                     retry.className = 'secondary';
                     retry.textContent = '重新读取清单';
-                    retry.addEventListener('click', () => void showRemoval(kind, id, showFiles, batchIds));
+                    retry.addEventListener('click', () => void showRemoval(kind, id, showFiles, batchIds, batchAuthorId));
                     message.after(retry);
                     controls.splice(controls.indexOf(byId('confirm-removal')), 1);
                 } else showToast(error.message, true);
@@ -735,29 +805,45 @@ function editReview(id) {
 
 function goToPage(page) { setParams({ page, q: byId('search').value }); }
 
+window.addEventListener('keydown', event => {
+    if (!modal.open || !modal.classList.contains('work-modal') || deleting) return;
+    if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+    if (event.key === 'Delete') {
+        const remove = modal.querySelector('button[data-remove-work]');
+        if (!remove) return;
+        event.preventDefault();
+        if (!event.repeat) remove.click();
+    } else if (workPreview?.listPage && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+        event.preventDefault();
+        if (!event.repeat) void stepWorkPreview(event.key === 'ArrowUp' ? -1 : 1);
+    }
+}, { capture: true });
+
 toolbar.addEventListener('click', event => {
-    const layout = event.target.closest('[data-author-layout]');
-    if (layout) setParams({ layout: layout.dataset.authorLayout === 'list' ? 'list' : null, q: byId('search').value });
+    const layout = event.target.closest('[data-view-layout]');
+    if (layout) setParams({ layout: layout.dataset.viewLayout === 'list' ? 'list' : null, q: byId('search').value });
 });
 toolbar.addEventListener('change', event => {
-    if (event.target.id !== 'select-author-page') return;
-    for (const box of results.querySelectorAll('input[data-select-author]')) {
-        if (event.target.checked) selectedAuthors.add(box.value);
-        else selectedAuthors.delete(box.value);
+    if (event.target.id !== 'select-page') return;
+    const selected = currentSelection();
+    for (const box of results.querySelectorAll('input[data-select-entry]')) {
+        if (event.target.checked) selected.add(box.value);
+        else selected.delete(box.value);
     }
-    updateAuthorSelection();
+    updateSelection();
 });
 results.addEventListener('change', event => {
-    const box = event.target.closest('input[data-select-author]');
+    const box = event.target.closest('input[data-select-entry]');
     if (!box) return;
-    if (box.checked) selectedAuthors.add(box.value);
-    else selectedAuthors.delete(box.value);
-    updateAuthorSelection();
+    const selected = currentSelection();
+    if (box.checked) selected.add(box.value);
+    else selected.delete(box.value);
+    updateSelection();
 });
 results.addEventListener('click', event => {
     const item = event.target.closest('button');
     if (!item) return;
-    if (item.dataset.work) void showWork(item.dataset.work);
+    if (item.dataset.work) void showWork(item.dataset.work, workListPage);
     if (item.dataset.review) editReview(item.dataset.review);
     if (item.hasAttribute('data-retry')) void loadList({ showLoading: true });
     if (item.hasAttribute('data-rescan')) void refreshStatus({ rescan: true });
@@ -783,12 +869,12 @@ byId('header-action').addEventListener('click', event => {
     if (author) void showRemoval('authors', author.dataset.removeAuthor);
     const link = event.target.closest('button[data-remove-author-links]');
     if (link) void showAuthorLinkRemoval(link.dataset.removeAuthorLinks);
-    if (event.target.closest('#clear-author-selection')) {
-        selectedAuthors.clear();
-        updateAuthorSelection();
+    if (event.target.closest('#clear-selection')) {
+        currentSelection().clear();
+        updateSelection();
     }
-    if (event.target.closest('#batch-delete-authors') && selectedAuthors.size) {
-        void showRemoval('authors', undefined, false, [...selectedAuthors]);
+    if (event.target.closest('#batch-delete-selection') && currentSelection().size) {
+        void showRemoval(route.authorId ? 'works' : 'authors', undefined, false, [...currentSelection()], route.authorId);
     }
 });
 byId('modal-close').addEventListener('click', () => modal.close());
@@ -801,7 +887,7 @@ modal.addEventListener('click', async event => {
     const removal = event.target.closest('[data-remove-work]');
     if (removal) void showRemoval('works', removal.dataset.removeWork);
     const back = event.target.closest('[data-work-back]');
-    if (back) void showWork(back.dataset.workBack);
+    if (back) void showWork(back.dataset.workBack, workPreview?.listPage);
     const copy = event.target.closest('[data-copy]');
     if (copy) {
         try {
@@ -815,6 +901,7 @@ modal.addEventListener('click', async event => {
 modal.addEventListener('close', () => {
     if (modal.open) return;
     modalVersion++;
+    workPreview = undefined;
     clearModalBody();
 });
 window.addEventListener('hashchange', navigate);

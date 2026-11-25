@@ -462,4 +462,52 @@ test('database catalog, media routes, refresh, and confirmed deletion', async t 
         assert.deepEqual(JSON.parse(await readFile(configFile, 'utf8')), { ...config, link: [otherLink] });
         assert.equal((await ready()).works, 1);
     });
+
+    await t.test('author detail batch removal is limited to the selected works of that author', async () => {
+        const samples = [
+            { id: '7477777777777777771', title: '同作者甲', author: 'sec-other', name: '其他作者' },
+            { id: '7477777777777777772', title: '同作者乙', author: 'sec-other', name: '其他作者' },
+            { id: '7477777777777777773', title: '不同作者丙', author: 'sec-third', name: '第三作者' },
+        ];
+        const database = new DatabaseSync(databaseFile);
+        try {
+            const insert = database.prepare(`INSERT INTO aweme
+                (aweme_id,aweme_type,title,author_id,author_name,author_sec_uid,create_time,file_path) VALUES (?,?,?,?,?,?,?,?)`);
+            for (const sample of samples) {
+                const directory = path.join(root, sample.name, 'post', sample.title);
+                await mkdir(directory, { recursive: true });
+                const file = path.join(directory, sample.title + '.mp4');
+                await writeFile(file, sample.title);
+                insert.run(sample.id, 'video', sample.title, sample.author, sample.name, sample.author, 1793520000, file);
+            }
+        } finally { database.close(); }
+
+        const page = await (await app.request('http://localhost/api/catalog/works')).json() as {
+            items: { id: string; authorId: string; platformId: string }[];
+        };
+        const items = samples.map(sample => page.items.find(item => item.platformId === sample.id)!);
+        const endpoint = `http://localhost/api/catalog/authors/${items[0]!.authorId}/works/batch-removal`;
+        const request = (method: string, ids: string[], token?: string) => app.request(endpoint, {
+            method, headers: { 'Content-Type': 'application/json', Origin: 'http://localhost' },
+            body: JSON.stringify({ ids, mode: 'permanent', token }),
+        });
+        const ids = items.slice(0, 2).map(item => item.id);
+        assert.equal((await request('POST', [ids[0]!, items[2]!.id])).status, 404);
+        const response = await request('POST', ids);
+        assert.equal(response.status, 200);
+        const plan = await response.json() as { token: string; works: { id: string }[]; removedLinks: number };
+        assert.deepEqual(plan.works.map(work => work.id).sort(), [...ids].sort());
+        assert.equal(plan.removedLinks, 0);
+        const config = await readFile(configFile, 'utf8');
+        assert.equal((await request('DELETE', [ids[0]!, items[2]!.id], plan.token)).status, 404);
+        const deleted = await request('DELETE', ids, plan.token);
+        assert.equal(deleted.status, 200, await deleted.clone().text());
+        assert.equal(await readFile(configFile, 'utf8'), config);
+        assert.equal((await ready()).works, 2);
+        for (const sample of samples.slice(0, 2)) {
+            await assert.rejects(stat(path.join(root, sample.name, 'post', sample.title, sample.title + '.mp4')));
+        }
+        assert.equal(await readFile(path.join(root, '其他作者', 'post', 'other-work', 'other-work.mp4'), 'utf8'), 'keep-other-author');
+        assert.equal(await readFile(path.join(root, '第三作者', 'post', '不同作者丙', '不同作者丙.mp4'), 'utf8'), '不同作者丙');
+    });
 });

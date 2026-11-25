@@ -348,11 +348,12 @@ app.get('/api/catalog/works/:id', c => browseDatabase(c, async snapshot => {
         copies: work.copies.map(({ flatFiles, ...copy }) => copy) });
 }));
 
-async function planRemoval(snapshot: DatabaseCatalog, kind: RemovalKind, ids: string[]) {
+async function planRemoval(snapshot: DatabaseCatalog, kind: RemovalKind, ids: string[], authorId?: string) {
     if (kind === 'authors' && ids.some(id => !snapshot.authorById.has(id))) return undefined;
     const selected = new Set(ids);
     const isSelected = (work: Work) => selected.has((kind === 'authors' ? work.authorId : work.id) ?? '');
     const works = snapshot.works.filter(isSelected);
+    if (authorId && works.some(work => work.authorId !== authorId)) return undefined;
     const local = await inspectWorks(snapshot, works);
     if (kind === 'authors') for (const id of ids) local.authorById.set(id, snapshot.authorById.get(id)!);
     // Missing local media still belongs to the confirmed database deletion scope.
@@ -364,11 +365,11 @@ async function planRemoval(snapshot: DatabaseCatalog, kind: RemovalKind, ids: st
         }
     }
     const rootName = path.basename(snapshot.root).toLowerCase();
-    const protectedPaths = kind === 'authors' ? snapshot.works.filter(item => !isSelected(item)).flatMap(item => item.copies.flatMap(copy => {
+    const protectedPaths = snapshot.works.filter(item => !isSelected(item)).flatMap(item => item.copies.flatMap(copy => {
         const parts = copy.path.split('/');
         const legacy = parts.length > 1 && parts[0]?.toLowerCase() === rootName;
         return legacy ? [copy.path, parts.slice(1).join('/')] : [copy.path];
-    })) : [];
+    }));
     const plan = await removalPlan(local, kind, ids, protectedPaths);
     if (!plan) return undefined;
     const linkPlan = kind === 'authors' ? planAuthorLinks(ids.map(id => snapshot.authorById.get(id)?.sharedKey)) : undefined;
@@ -378,18 +379,18 @@ async function planRemoval(snapshot: DatabaseCatalog, kind: RemovalKind, ids: st
     return { local, plan, linkPlan };
 }
 
-function previewRemoval(c: Context, kind: RemovalKind, ids: string[]) {
+function previewRemoval(c: Context, kind: RemovalKind, ids: string[], authorId?: string) {
     return browseDatabase(c, async snapshot => {
         if (removing) return c.json({ error: '正在删除文件，请稍后再查看' }, 409);
         try {
-            const result = await planRemoval(snapshot, kind, ids);
+            const result = await planRemoval(snapshot, kind, ids, authorId);
             return result ? c.json({ ...result.plan.view, removedLinks: result.linkPlan?.matches.length ?? 0 })
                 : c.json({ error: '部分选择已不存在，请刷新列表后重新选择' }, 404);
         } catch (error) { return linkConfigFailure(c, error, '无法读取删除范围或下载器配置'); }
     });
 }
 
-async function commitRemoval(c: Context, kind: RemovalKind, ids: string[], token: string) {
+async function commitRemoval(c: Context, kind: RemovalKind, ids: string[], token: string, authorId?: string) {
     if (scan || removing) return c.json({ error: '索引正在更新，请稍后再试' }, 409);
     removing = true;
     let attempted = false;
@@ -402,7 +403,7 @@ async function commitRemoval(c: Context, kind: RemovalKind, ids: string[], token
     let linkChange: { before: ReturnType<typeof readConfigLinks>; saved: ReturnType<typeof saveConfigLinks> } | undefined;
     try {
         const snapshot = await loadDatabaseCatalog();
-        const result = await planRemoval(snapshot, kind, ids);
+        const result = await planRemoval(snapshot, kind, ids, authorId);
         if (!result) return c.json({ error: '部分选择已不存在，请刷新列表后重新选择' }, 404);
         const { local, plan, linkPlan } = result;
         if (plan.view.token !== token || await loadDatabaseCatalog() !== snapshot) {
@@ -445,22 +446,27 @@ function isRemovalToken(body: unknown): body is { mode: 'permanent'; token: stri
     return request?.mode === 'permanent' && typeof request.token === 'string' && /^[a-f0-9]{64}$/.test(request.token);
 }
 
-function authorSelection(value: unknown): string[] | undefined {
+function removalSelection(value: unknown): string[] | undefined {
     if (!Array.isArray(value) || !value.length || !value.every(id => typeof id === 'string' && /^[a-f0-9]{24}$/.test(id))) return undefined;
     return [...new Set<string>(value)].sort();
 }
 
-const batchRemovalPath = '/api/catalog/authors/batch-removal';
-app.on(['POST', 'DELETE'], batchRemovalPath, async c => {
-    if (!isLocalRequest(c)) return c.json({ error: '删除功能仅支持本机同源请求' }, 403);
-    if (!/^application\/json(?:\s*;|$)/i.test(c.req.header('Content-Type') ?? '')) return c.json({ error: '需要 JSON 请求' }, 415);
-    const body = await c.req.json().catch(() => null);
-    const ids = authorSelection(body?.ids);
-    if (!ids) return c.json({ error: '请选择要删除的作者' }, 400);
-    if (c.req.method === 'POST') return previewRemoval(c, 'authors', ids);
-    if (!isRemovalToken(body)) return c.json({ error: '请查看删除清单并确认永久删除' }, 400);
-    return commitRemoval(c, 'authors', ids, body.token);
-});
+function batchRemoval(kind: RemovalKind, pathname: string) {
+    app.on(['POST', 'DELETE'], pathname, async c => {
+        if (!isLocalRequest(c)) return c.json({ error: '删除功能仅支持本机同源请求' }, 403);
+        if (!/^application\/json(?:\s*;|$)/i.test(c.req.header('Content-Type') ?? '')) return c.json({ error: '需要 JSON 请求' }, 415);
+        const body = await c.req.json().catch(() => null);
+        const ids = removalSelection(body?.ids);
+        if (!ids) return c.json({ error: `请选择要删除的${kind === 'authors' ? '作者' : '作品'}` }, 400);
+        const authorId = c.req.param('authorId');
+        if (c.req.method === 'POST') return previewRemoval(c, kind, ids, authorId);
+        if (!isRemovalToken(body)) return c.json({ error: '请查看删除清单并确认永久删除' }, 400);
+        return commitRemoval(c, kind, ids, body.token, authorId);
+    });
+}
+
+batchRemoval('authors', '/api/catalog/authors/batch-removal');
+batchRemoval('works', '/api/catalog/authors/:authorId/works/batch-removal');
 
 for (const kind of ['works', 'authors'] as const) {
     app.get(`/api/catalog/${kind}/:id/${kind === 'works' ? 'files' : 'removal'}`, c => previewRemoval(c, kind, [c.req.param('id')]));

@@ -108,14 +108,14 @@ function parentUnit(units: Map<string, Unit>, relative: string) {
 }
 
 export async function removalPlan(catalog: Catalog, kind: RemovalKind, ids: string[], protectedPaths: string[] = []) {
-    const work = kind === 'works' ? catalog.workById.get(ids[0]!) : undefined;
     const authors = kind === 'authors' ? ids.flatMap(id => {
         const author = catalog.authorById.get(id);
         return author ? [author] : [];
     }) : [];
-    if (!work && (!authors.length || authors.length !== ids.length)) return undefined;
     const selected = new Set(ids);
-    const works = work ? [work] : catalog.works.filter(item => item.authorId && selected.has(item.authorId));
+    const works = catalog.works.filter(item => selected.has((kind === 'works' ? item.id : item.authorId) ?? ''));
+    if (!ids.length || (kind === 'works' ? works.length : authors.length) !== ids.length) return undefined;
+    const work = kind === 'works' && works.length === 1 ? works[0] : undefined;
     const copies = await parallelMap(works.flatMap(item => item.copies), copy => copyInventory(catalog.root, copy));
     const targets = new Map(copies.flatMap(copy => copy.units).map(unit => [pathKey(unit.relative), unit]));
     const units = [...targets.values()].filter(unit => !parentUnit(targets, unit.relative));
@@ -139,7 +139,7 @@ export async function removalPlan(catalog: Catalog, kind: RemovalKind, ids: stri
             title: work?.title ?? (authors.length === 1 ? authors[0]!.name : undefined), token, errors, workCount: works.length, copyCount: copies.length,
             fileCount: entries.length, size: entries.reduce((sum, file) => sum + (file.size ?? 0), 0),
             copies: work ? copies.map(({ units, files, ...copy }) => ({ ...copy, files: files.map(({ stamp, identity, ...file }) => file) })) : undefined,
-            works: authors.length ? works.slice(0, 50).map(item => ({ id: item.id, title: item.title, copyCount: item.copies.length })) : undefined,
+            works: works.slice(0, 50).map(item => ({ id: item.id, title: item.title, copyCount: item.copies.length })),
             authors: authors.map(({ id, name, workCount }) => ({ id, name, workCount })),
         },
     };
