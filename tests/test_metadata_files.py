@@ -55,6 +55,28 @@ async def test_directory_records_become_primary_file_records_in_batch(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_appledouble_files_are_not_selected_as_metadata_or_primary_media(tmp_path):
+    database = Database(str(tmp_path / "test.db"))
+    await database.initialize()
+    item_id = "7422222222222222223"
+    for suffix in ("_data.json", "_video.mp4", "_cover.jpg", "_avatar.jpg"):
+        (tmp_path / ("._" + item_id + suffix)).write_bytes(b"appledouble metadata")
+        (tmp_path / (item_id + suffix)).write_bytes(b"real file")
+    await database.add_aweme({
+        "aweme_id": item_id, "aweme_type": "video", "file_path": str(tmp_path),
+        "metadata": json.dumps({"aweme_id": item_id}),
+    })
+    connection = await database._get_conn()
+    cursor = await connection.execute("SELECT file_path,metadata_path,cover_path,avatar_path FROM aweme")
+    values = await cursor.fetchone()
+    assert all(not Path(value).name.startswith("._") for value in values)
+    assert Path(values[0]).name == item_id + "_video.mp4"
+    assert Path(values[1]).name == item_id + "_data.json"
+    assert (tmp_path / ("._" + item_id + "_data.json")).read_bytes() == b"appledouble metadata"
+    await database.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("with_path", [False, True])
 async def test_failed_json_write_keeps_original_database_payload(monkeypatch, tmp_path, with_path):
     database = Database(str(tmp_path / "test.db"))

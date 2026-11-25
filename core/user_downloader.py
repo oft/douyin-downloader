@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 import aiofiles
 
-from core.api_client import DouyinAPIClient, UserUnavailableError
+from core.api_client import BrowserPageAccessError, DouyinAPIClient, UserUnavailableError
 from core.downloader_base import BaseDownloader, DownloadResult
 from core.metadata import build_author_home_url
 from core.user_mode_registry import UserModeRegistry
@@ -547,6 +547,8 @@ class UserDownloader(BaseDownloader):
         on_items=None,
     ) -> None:
         self._browser_post_incomplete_reason = None
+        self._browser_post_empty_reason = None
+        self._browser_post_empty_confirmed = False
         unavailable_reason = self._browser_recovery_unavailable_reason()
         if unavailable_reason:
             self._progress_update_step("拉取作品列表", f"浏览器回补不可用（{unavailable_reason}）")
@@ -578,14 +580,17 @@ class UserDownloader(BaseDownloader):
             int(browser_cfg.get("wait_timeout_seconds", 600) or 600),
         )
         stream_seen = {str(item.get("aweme_id")) for item in aweme_list}
+        ignored_browser_ids = set()
 
         async def deliver(items):
             fresh = []
             for item in items:
                 key = str(item.get("aweme_id") or "")
                 author = item.get("author") or {}
-                if not key or key in stream_seen or (
-                        author.get("sec_uid") and str(author["sec_uid"]) != str(sec_uid)):
+                if author.get("sec_uid") and str(author["sec_uid"]) != str(sec_uid):
+                    ignored_browser_ids.add(key)
+                    continue
+                if not key or key in stream_seen:
                     continue
                 stream_seen.add(key)
                 fresh.append(item)
@@ -606,7 +611,7 @@ class UserDownloader(BaseDownloader):
                 wait_timeout_seconds=int(browser_cfg.get("wait_timeout_seconds", 600) or 600),
                 **stream_options,
             )
-        except (UserUnavailableError, BrowserUnavailableError):
+        except (UserUnavailableError, BrowserUnavailableError, BrowserPageAccessError):
             raise
         except Exception:
             if on_items is not None:
@@ -638,11 +643,20 @@ class UserDownloader(BaseDownloader):
                        "interrupted": "浏览器采集发生异常"}
             reason = reasons.get(browser_post_stats.get("stop_reason"), "浏览器未确认作品列表结束")
             self._browser_post_incomplete_reason = "作品列表可能未取全：" + reason
+        failure_reason = browser_post_stats.get("failure_reason")
+        if isinstance(failure_reason, str) and failure_reason:
+            self._browser_post_empty_reason = "浏览器未获取到作品列表：" + failure_reason
+            if browser_post_stats.get("complete") is False:
+                self._browser_post_incomplete_reason = "作品列表可能未取全：" + failure_reason
 
         if on_items is not None and browser_post_stats.get("stop_reason") == "number_limit":
             return
 
         if not browser_aweme_ids:
+            self._browser_post_empty_confirmed = (
+                browser_post_stats.get("complete") is True
+                and browser_post_stats.get("has_more") is False
+                and browser_post_stats.get("post_pages", 0) > 0)
             logger.warning(
                 "Browser fallback returned no aweme_id: duration_ms=%s stats=%s",
                 int((time.monotonic() - fallback_started) * 1000),
@@ -651,7 +665,8 @@ class UserDownloader(BaseDownloader):
             return
 
         existing_ids = {str(item.get("aweme_id")) for item in aweme_list if item.get("aweme_id")}
-        missing_ids = [aweme_id for aweme_id in browser_aweme_ids if aweme_id not in existing_ids]
+        missing_ids = [aweme_id for aweme_id in browser_aweme_ids
+                       if aweme_id not in existing_ids and aweme_id not in ignored_browser_ids]
         if not missing_ids:
             logger.info(
                 "Browser fallback found no missing items: browser_ids=%s existing=%s "
@@ -732,6 +747,7 @@ class UserDownloader(BaseDownloader):
             detail_reason = "{}条作品详情未能获取".format(detail_failed)
             self._browser_post_incomplete_reason = "；".join(filter(None, [
                 self._browser_post_incomplete_reason, detail_reason]))
+            self._browser_post_empty_reason = "浏览器已识别作者作品链接，但{}（详情接口未返回可用内容）".format(detail_reason)
             logger.warning(
                 "Browser fallback detail fetch failed: %s/%s",
                 detail_failed,

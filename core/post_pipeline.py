@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 
-from core.api_client import LoginRequiredError, UserUnavailableError
+from core.api_client import BrowserPageAccessError, LoginRequiredError, UserUnavailableError
 from core.downloader_base import DownloadResult
 from storage.download_queue import DownloadQueueStore
 from utils.browser_runtime import BrowserUnavailableError
@@ -157,7 +157,7 @@ class PostDownloadPipeline:
             tasks.append(asyncio.create_task(produce()))
             await asyncio.gather(*tasks)
             if collection_error and (not self.result.total or isinstance(
-                    collection_error, (BrowserUnavailableError, LoginRequiredError, UserUnavailableError))):
+                    collection_error, (BrowserUnavailableError, BrowserPageAccessError, LoginRequiredError, UserUnavailableError))):
                 raise collection_error
             if self.store:
                 remaining = await self.store.unfinished_count()

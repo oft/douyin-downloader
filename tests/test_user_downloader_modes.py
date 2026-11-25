@@ -621,6 +621,49 @@ async def test_streamed_number_limit_is_applied_after_filters_across_pages(tmp_p
     assert result.total == result.success == 2
 
 
+@pytest.mark.parametrize("stats,expected", [
+    ({"complete": False, "failure_reason": "作者作品分页请求返回 HTTP 429"}, "HTTP 429"),
+    ({"complete": False, "failure_reason": "页面导航未完成（net::ERR_ABORTED）"}, "net::ERR_ABORTED"),
+    ({"complete": True, "has_more": False, "post_pages": 1}, None),
+])
+async def test_empty_browser_listing_uses_evidence_instead_of_a_generic_failure(tmp_path, monkeypatch, stats, expected):
+    downloader = _build_downloader(tmp_path, mode=["post"])
+    downloader.config._data["browser_fallback"]["enabled"] = True
+    downloader.api_client.prefer_browser_posts = True
+    monkeypatch.setattr(downloader, "_browser_backend_missing", lambda: False)
+    monkeypatch.setattr(downloader.api_client, "collect_user_post_ids_via_browser", AsyncMock(return_value=[]), raising=False)
+    monkeypatch.setattr(downloader.api_client, "pop_browser_post_stats", lambda: stats, raising=False)
+    strategy = downloader._get_mode_strategy("post")
+    if expected:
+        with pytest.raises(post_strategy_module.PageRequestFailedError, match=expected):
+            await strategy.collect_items("sec_uid_x", {})
+    else:
+        assert await strategy.collect_items("sec_uid_x", {}) == []
+        assert strategy.incomplete_reason is None
+
+
+async def test_foreign_page_items_are_not_retried_as_eight_missing_author_details(tmp_path, monkeypatch):
+    downloader = _build_downloader(tmp_path, mode=["post"])
+    downloader.stream_downloads = True
+    downloader.config._data["browser_fallback"]["enabled"] = True
+    downloader.api_client.prefer_browser_posts = True
+    monkeypatch.setattr(downloader, "_browser_backend_missing", lambda: False)
+    async def browser(_uid, *, on_items, **_kwargs):
+        works = [_make_aweme("owned")] + [
+            {**_make_aweme("foreign-" + str(i)), "author": {"sec_uid": "other-user"}}
+            for i in range(8)]
+        await on_items(works)
+        return [work["aweme_id"] for work in works]
+    monkeypatch.setattr(downloader.api_client, "collect_user_post_ids_via_browser", browser, raising=False)
+    monkeypatch.setattr(downloader.api_client, "pop_browser_post_stats", lambda: {"complete": True}, raising=False)
+    detail = AsyncMock(side_effect=AssertionError("Must not request foreign details"))
+    monkeypatch.setattr(downloader.api_client, "get_video_detail", detail, raising=False)
+    monkeypatch.setattr(downloader, "_process_mode_aweme", AsyncMock(return_value={"status": "success"}))
+    result = await downloader.download({"sec_uid": "sec_uid_x"})
+    assert result.total == result.success == 1 and result.incomplete_reason is None
+    detail.assert_not_awaited()
+
+
 def test_post_strategy_browser_recovery_counts_filtered_media(tmp_path, monkeypatch):
     downloader = _build_downloader(tmp_path, mode=["post"])
     downloader.config._data["number"]["post"] = 2

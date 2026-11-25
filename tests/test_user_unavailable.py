@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from core.api_client import DouyinAPIClient, UserUnavailableError
+from core.api_client import BrowserPageAccessError, DouyinAPIClient, UserUnavailableError
 from utils.browser_runtime import BrowserUnavailableError
 
 
@@ -63,6 +63,12 @@ async def test_page_read_failure_is_not_classified_as_unavailable():
     await client._check_browser_user_available(
         SimpleNamespace(evaluate=AsyncMock(side_effect=RuntimeError("page closed")))
     )
+
+
+async def test_web_service_error_is_not_classified_as_a_missing_author():
+    with pytest.raises(BrowserPageAccessError, match="服务异常"):
+        await DouyinAPIClient({})._check_browser_user_available(
+            SimpleNamespace(evaluate=AsyncMock(return_value="网页服务异常")))
 
 
 @pytest.mark.asyncio

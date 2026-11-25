@@ -4,6 +4,7 @@ import asyncio
 import re
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from core.api_client import DouyinAPIClient, UserUnavailableError
@@ -115,7 +116,11 @@ def entity_matches(target, data):
 
 class LinkChecker:
     def __init__(self, config, *, show_browser=False):
-        self.session = BrowserSession()
+        persistent = bool(getattr(config, "config_path", None))
+        self.session = BrowserSession(
+            profile_dir=Path("config/browser-profile") if persistent else None,
+            cookie_path=Path("config/cookies.json") if persistent else None)
+        self._initialized = False
         self.client = DouyinAPIClient(config.get_cookies(), proxy=config.get("proxy"),
                                      browser_session=self.session)
         self.client._BROWSER_COOKIE_BLOCKLIST = set()
@@ -133,6 +138,9 @@ class LinkChecker:
         if urlsplit(url).hostname not in {"v.douyin.com", "v.iesdouyin.com"} and not URLParser.parse(url):
             return checked_result(link, "unknown", "此链接类型暂不能可靠检测，未判定为失效")
         try:
+            if not self._initialized:
+                await self.session.initialize()
+                self._initialized = True
             return await asyncio.wait_for(self._check_page(link, url), timeout=_CHECK_TIMEOUT_SECONDS)
         except UserUnavailableError as error:
             status = "restricted" if error.reason.startswith("私密账号") else "unavailable"

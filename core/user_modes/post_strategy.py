@@ -113,7 +113,8 @@ class PostUserModeStrategy(BaseUserModeStrategy):
             aweme_list: List[Dict[str, Any]] = []
             await self._recover_with_browser(sec_uid, user_info, aweme_list)
             if not aweme_list:
-                raise PageRequestFailedError(_EMPTY_BROWSER_POST_LIST_MESSAGE)
+                if getattr(self.downloader, "_browser_post_empty_confirmed", False) is not True:
+                    raise PageRequestFailedError(self._browser_empty_message())
             self._raw_items_seen = len(aweme_list)
             self._report_walk_summary(aweme_list, user_info)
             return aweme_list
@@ -126,16 +127,23 @@ class PostUserModeStrategy(BaseUserModeStrategy):
         if pagination_restricted:
             recovered = await self._recover_with_browser(sec_uid, user_info, aweme_list)
             if not aweme_list:
+                if getattr(self.downloader, "_browser_post_empty_confirmed", False) is True:
+                    self.incomplete_reason = None
+                    return []
                 # PageRequestFailedError 让 UserDownloader 接着跑剩下的模式。
                 if (getattr(self.downloader.api_client, "prefer_browser_posts", False) is True
                         and self._browser_recovery_available()):
-                    raise PageRequestFailedError(_EMPTY_BROWSER_POST_LIST_MESSAGE)
+                    raise PageRequestFailedError(self._browser_empty_message())
                 raise PageRequestFailedError(self._failure_message or _EMPTY_POST_LIST_MESSAGE)
             if self._hard_truncation and not recovered:
                 self.incomplete_reason = self._hard_truncation
                 logger.warning("User post walk incomplete: %s", self.incomplete_reason)
         self._report_walk_summary(aweme_list, user_info)
         return aweme_list
+
+    def _browser_empty_message(self):
+        reason = getattr(self.downloader, "_browser_post_empty_reason", None)
+        return reason if isinstance(reason, str) and reason else _EMPTY_BROWSER_POST_LIST_MESSAGE
 
     async def _recover_with_browser(
         self,

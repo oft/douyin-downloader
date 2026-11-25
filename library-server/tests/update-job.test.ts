@@ -47,7 +47,7 @@ test('keeps one update running until the child receives the stop request', { tim
 });
 
 test('reports completion, login failure and missing dependencies', async () => {
-    for (const [code, state] of [[0, 'completed'], [3, 'failed'], [4, 'failed']]) {
+    for (const [code, state] of [[0, 'completed'], [3, 'failed'], [4, 'failed'], [5, 'failed']]) {
         const job = new UpdateJob(process.execPath, ['-e', `process.exit(${code})`], process.cwd());
         job.start();
         await waitFor(() => !job.active);
@@ -55,6 +55,7 @@ test('reports completion, login failure and missing dependencies', async () => {
         assert.equal(job.status.exitCode, code);
         if (code === 3) assert.match(job.status.error ?? '', /登录/);
         if (code === 4) assert.match(job.status.error ?? '', /PYTHON_EXECUTABLE/);
+        if (code === 5) assert.match(job.status.error ?? '', /服务异常/);
     }
 });
 
@@ -121,4 +122,31 @@ test('update routes validate local requests and expose start failures', async t 
     }
     assert.equal(result?.state, 'failed');
     assert.match(result?.error ?? '', /Python/);
+    const browser = 'http://localhost/api/catalog/browser';
+    assert.equal((await app.request(browser + '/open', { method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://example.com' }, body: '{}' })).status, 403);
+    assert.equal((await app.request(browser + '/open', { method: 'POST' })).status, 415);
+    assert.equal((await app.request(browser + '/open', { method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'http://localhost' }, body: '{}' })).status, 202);
+    for (let retry = 0; retry < 100; retry++) {
+        const current = await (await app.request(browser)).json() as { state: string; error?: string };
+        if (current.state === 'failed') { assert.match(current.error ?? '', /Python/); break; }
+        await setTimeout(25);
+        assert.ok(retry < 99, 'The fake missing interpreter must fail without launching a browser');
+    }
+});
+
+test('focus commands do not stop the existing child process', async () => {
+    const lines: string[] = [];
+    const job = new UpdateJob(process.execPath, ['-e', `
+        process.stdin.on('data', chunk => { if (chunk.toString().includes('focus')) console.log('focused'); });
+        process.stdin.on('end', () => process.exit(130));
+    `], process.cwd(), line => lines.push(line));
+    job.start();
+    job.send({ action: 'focus' });
+    await waitFor(() => lines.includes('focused'));
+    assert.equal(job.active, true);
+    job.stop();
+    await waitFor(() => !job.active);
+    assert.equal(job.status.state, 'stopped');
 });

@@ -14,7 +14,7 @@ import pytest
 from agent_mode.logging_guard import snapshot_logging
 from agent_mode.version import get_version
 from core import LoginRequiredError
-from core.api_client import UserUnavailableError
+from core.api_client import BrowserPageAccessError, UserUnavailableError
 from utils.browser_runtime import BrowserUnavailableError
 
 main_module = importlib.import_module("cli.main")
@@ -70,6 +70,12 @@ async def _download_with(monkeypatch, tmp_path, exc):
 async def test_download_url_lets_login_required_through(monkeypatch, tmp_path):
     with pytest.raises(LoginRequiredError):
         await _download_with(monkeypatch, tmp_path, _login_error())
+
+
+@pytest.mark.parametrize("error", [BrowserUnavailableError("closed"), BrowserPageAccessError("service error")])
+async def test_download_url_preserves_batch_stopping_browser_errors(monkeypatch, tmp_path, error):
+    with pytest.raises(type(error)):
+        await _download_with(monkeypatch, tmp_path, error)
 
 
 @pytest.mark.asyncio
@@ -289,7 +295,7 @@ async def test_optional_browser_is_not_required_for_ordinary_cli_downloads(monke
 @pytest.mark.asyncio
 async def test_main_owns_one_browser_session_for_all_urls_and_closes_it(monkeypatch, tmp_path, outcome):
     args = _prepare_main_async(monkeypatch, tmp_path, [None, None])
-    session = SimpleNamespace(close=AsyncMock())
+    session = SimpleNamespace(close=AsyncMock(), initialize=AsyncMock(), release_for_login=AsyncMock())
     factory = MagicMock(return_value=session)
     received = []
 
@@ -311,7 +317,7 @@ async def test_main_owns_one_browser_session_for_all_urls_and_closes_it(monkeypa
         code = await main_module.main_async(args)
         assert code == (main_module.EXIT_ENVIRONMENT if outcome == "browser_failure" else None)
     assert received == [session, session]
-    factory.assert_called_once_with()
+    factory.assert_called_once()
     session.close.assert_awaited_once()
 
 
@@ -323,6 +329,12 @@ async def test_browser_launch_failure_stops_batch_instead_of_failing_every_link(
     assert await main_module.main_async(args) == main_module.EXIT_ENVIRONMENT
     assert main_module.display.start_url.call_count == 1
     assert main_module.display.fail_url.call_count == 1
+
+
+async def test_service_error_stops_batch_before_requesting_next_author(monkeypatch, tmp_path):
+    args = _prepare_main_async(monkeypatch, tmp_path, [BrowserPageAccessError("网页服务异常"), _result(success=1)])
+    assert await main_module.main_async(args) == main_module.EXIT_PAGE_ACCESS
+    assert main_module.display.start_url.call_count == 1
 
 
 @pytest.mark.parametrize("interactive", [False, True])

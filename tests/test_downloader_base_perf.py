@@ -190,6 +190,18 @@ async def test_local_index_scans_once_per_downloader_instance(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_appledouble_metadata_is_not_counted_as_downloaded_media(tmp_path):
+    phantom = "7346971177114611998"
+    actual = "7346971177114611999"
+    (tmp_path / ("._2026-01-01_title_" + phantom + ".mp4")).write_bytes(b"appledouble metadata")
+    (tmp_path / ("2026-01-01_title_" + actual + ".mp4")).write_bytes(b"video")
+    downloader, api = _build_downloader(tmp_path)
+    assert downloader._is_locally_downloaded(phantom) is False
+    assert downloader._is_locally_downloaded(actual) is True
+    await api.close()
+
+
+@pytest.mark.asyncio
 async def test_local_index_not_shared_across_base_paths(tmp_path):
     root_a = tmp_path / "a"
     root_b = tmp_path / "b"

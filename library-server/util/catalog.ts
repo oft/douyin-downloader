@@ -263,7 +263,7 @@ export async function inspectCatalogRows(root: string, rows: WorkRow[], scannedA
         const recordedStats = await stat(absolute).catch(() => undefined);
         if (recordedStats?.isDirectory()) {
             const entries = await readdir(absolute, { withFileTypes: true });
-            const matching = entries.filter(entry => entry.isFile() && entry.name.includes(row.aweme_id));
+            const matching = entries.filter(entry => entry.isFile() && !entry.name.startsWith('._') && entry.name.includes(row.aweme_id));
             const primary = matching.find(entry => row.aweme_type === 'gallery'
                 ? /_(?:image_)?\d+\.(?:jpe?g|png|webp)$/i.test(entry.name)
                 : looseVideoPattern.test(entry.name) && !/_live_\d+\./i.test(entry.name));
@@ -280,7 +280,7 @@ export async function inspectCatalogRows(root: string, rows: WorkRow[], scannedA
             let pending = directoryFiles.get(directory);
             if (!pending) {
                 pending = readdir(directory, { withFileTypes: true }).then(entries =>
-                    entries.filter(entry => entry.isFile()).map(entry => entry.name));
+                    entries.filter(entry => entry.isFile() && !entry.name.startsWith('._')).map(entry => entry.name));
                 directoryFiles.set(directory, pending);
             }
             files = (await pending).filter(file =>

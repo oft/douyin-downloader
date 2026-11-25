@@ -3,6 +3,7 @@ import asyncio
 import json
 import re
 import sys
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import parse_qs, unquote, urlparse
@@ -86,7 +87,7 @@ async def capture_cookies(args: argparse.Namespace) -> int:
         )
         return 1
 
-    async with async_playwright() as p:
+    async with async_playwright() as p, AsyncExitStack() as cleanup:
         browser_factory = getattr(p, args.browser)
         from utils.browser_runtime import chromium_launch_options
 
@@ -94,9 +95,21 @@ async def capture_cookies(args: argparse.Namespace) -> int:
             await chromium_launch_options(browser_factory, headless=args.headless)
             if args.browser == "chromium" else {}
         )
-        browser = await browser_factory.launch(headless=args.headless, **launch_options)
-        context = await browser.new_context()
-        page = await context.new_page()
+        login_session = None
+        if args.browser == "chromium":
+            from core.browser_session import BrowserSession
+            login_session = BrowserSession(profile_dir=args.output.parent / "browser-profile",
+                                            cookie_path=args.output)
+            cleanup.push_async_callback(login_session.close)
+            await login_session.initialize()
+            await login_session._ensure(headless=args.headless,
+                user_agent=login_session.user_agent or "", cookies=[], proxy="")
+            context, page = login_session._context, login_session._page
+            browser = login_session._browser
+        else:
+            browser = await browser_factory.launch(headless=args.headless, **launch_options)
+            context = await browser.new_context()
+            page = await context.new_page()
         observed_cookie_headers: List[str] = []
         observed_mstokens: List[str] = []
 
@@ -124,11 +137,13 @@ async def capture_cookies(args: argparse.Namespace) -> int:
 
         await wait_for_login_confirmation(page, args.url)
 
-        storage = await context.storage_state()
+        # Full storage export can open a temporary tab and disturb manual login.
+        captured = await context.cookies()
         cookies = {
             cookie["name"]: cookie["value"]
-            for cookie in storage["cookies"]
-            if cookie["domain"].endswith("douyin.com")
+            for cookie in captured
+            if cookie["domain"].lstrip(".") == "douyin.com"
+            or cookie["domain"].endswith(".douyin.com")
         }
         cookies = sanitize_cookies(cookies)
 
@@ -139,8 +154,11 @@ async def capture_cookies(args: argparse.Namespace) -> int:
             cookies["msToken"] = ms_token
             print("[INFO] Extracted msToken from alternate sources.")
 
-        await context.close()
-        await browser.close()
+        if login_session is not None:
+            await login_session.close()
+        else:
+            await context.close()
+            await browser.close()
 
     picked = cookies if args.include_all else filter_cookies(cookies)
     picked = sanitize_cookies(picked)

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { lstat, readdir, realpath, rmdir, unlink } from 'node:fs/promises';
+import { lstat, open, readdir, realpath, rmdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import type { Stats } from 'node:fs';
 import { parallelMap } from './catalog.ts';
@@ -14,6 +14,7 @@ interface Entry {
     size?: number;
     stamp: string;
     identity: string;
+    appleDouble?: boolean;
 }
 
 interface Unit {
@@ -23,6 +24,7 @@ interface Unit {
     identity: string;
     size?: number;
     entries?: Entry[];
+    appleDouble?: boolean;
 }
 
 const order = new Intl.Collator('zh-CN', { numeric: true });
@@ -51,6 +53,22 @@ async function inspectPath(absolute: string, kind: Unit['kind']) {
     return details;
 }
 
+async function appleDouble(absolute: string, info: Stats) {
+    if (!path.basename(absolute).startsWith('._') || !info.isFile()) return false;
+    let handle;
+    try { handle = await open(absolute, 'r'); }
+    catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+        throw error;
+    }
+    try {
+        if (identity(await handle.stat()) !== identity(info)) throw new Error('元数据文件已被替换');
+        const header = Buffer.alloc(4);
+        const { bytesRead } = await handle.read(header, 0, 4, 0);
+        return bytesRead === 4 && header.readUInt32BE(0) === 0x00051607;
+    } finally { await handle.close(); }
+}
+
 async function filesIn(directory: string) {
     const files: Entry[] = [];
     async function visit(prefix: string) {
@@ -59,9 +77,15 @@ async function filesIn(directory: string) {
         const names = (await readdir(current)).sort(order.compare);
         for (const name of names) {
             const relative = prefix ? `${prefix}/${name}` : name;
-            const details = await lstat(path.join(current, name));
+            let details;
+            try { details = await lstat(path.join(current, name)); }
+            catch (error) {
+                if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+                throw error;
+            }
             const kind = entryKind(details);
-            files.push({ name: relative, kind, size: kind === 'file' ? details.size : undefined, stamp: stamp(details), identity: identity(details) });
+            const metadata = await appleDouble(path.join(current, name), details);
+            files.push({ name: relative, kind, size: kind === 'file' ? details.size : undefined, stamp: stamp(details), identity: identity(details), ...(metadata ? { appleDouble: true } : {}) });
             if (kind === 'directory') await visit(relative);
         }
     }
@@ -79,8 +103,14 @@ async function copyInventory(root: string, copy: WorkCopy) {
             await assertDirectory(directory);
             for (const name of copy.flatFiles) {
                 const relative = copy.directory ? `${copy.directory}/${name}` : name;
-                const details = await inspectPath(fromRoot(root, relative), 'file');
-                units.push({ relative, kind: 'file', size: details.size, stamp: stamp(details), identity: identity(details) });
+                let details;
+                try { details = await inspectPath(fromRoot(root, relative), 'file'); }
+                catch (error) {
+                    if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+                    throw error;
+                }
+                const metadata = await appleDouble(fromRoot(root, relative), details);
+                units.push({ relative, kind: 'file', size: details.size, stamp: stamp(details), identity: identity(details), ...(metadata ? { appleDouble: true } : {}) });
                 files.push({ name, kind: 'file', size: details.size, stamp: stamp(details), identity: identity(details) });
             }
         } else {
@@ -145,23 +175,37 @@ export async function removalPlan(catalog: Catalog, kind: RemovalKind, ids: stri
     };
 }
 
-async function deleteEntry(absolute: string, expected: Pick<Entry, 'kind' | 'identity' | 'stamp'>) {
+type RemovalOperations = Pick<typeof import('node:fs/promises'), 'unlink' | 'rmdir'>;
+
+async function deleteEntry(absolute: string, expected: Pick<Entry, 'kind' | 'identity' | 'stamp' | 'appleDouble'>, operations: RemovalOperations) {
     await assertDirectory(path.dirname(absolute));
-    const details = await lstat(absolute);
+    let details;
+    try { details = await lstat(absolute); }
+    catch (error) {
+        if (expected.appleDouble && expected.kind === 'file' && (error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+        throw error;
+    }
     if (entryKind(details) !== expected.kind || identity(details) !== expected.identity) throw new Error('文件或目录已被替换');
     if (expected.kind === 'directory') {
         await assertDirectory(absolute);
-        await rmdir(absolute);
+        await operations.rmdir(absolute);
     } else {
         if (stamp(details) !== expected.stamp) throw new Error('文件内容已变更');
-        await unlink(absolute);
+        try { await operations.unlink(absolute); }
+        catch (error) {
+            if (expected.appleDouble && (error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+            throw error;
+        }
     }
+    return true;
 }
 
-export async function deletePermanently(root: string, units: Unit[]) {
+export async function deletePermanently(root: string, units: Unit[], operations: RemovalOperations = { unlink, rmdir }) {
     await assertDirectory(root);
+    const rootIdentity = identity(await lstat(root));
     let deletedFiles = 0;
     let deletedDirectories = 0;
+    let currentPath = '';
     try {
         // Recheck every top-level target before deleting any files.
         const targets = await parallelMap(units, async unit => {
@@ -172,17 +216,21 @@ export async function deletePermanently(root: string, units: Unit[]) {
         });
         for (const [index, unit] of units.entries()) {
             for (const entry of (unit.entries ?? []).slice().reverse()) {
-                await deleteEntry(fromRoot(root, `${unit.relative}/${entry.name}`), entry);
+                currentPath = `${unit.relative}/${entry.name}`;
+                if (!await deleteEntry(fromRoot(root, currentPath), entry, operations)) continue;
                 if (entry.kind === 'directory') deletedDirectories++;
                 else deletedFiles++;
             }
-            await deleteEntry(targets[index]!, unit);
+            currentPath = unit.relative;
+            if (!await deleteEntry(targets[index]!, unit, operations)) continue;
             if (unit.kind === 'directory') deletedDirectories++;
             else deletedFiles++;
         }
+        await assertDirectory(root);
+        if (identity(await lstat(root)) !== rootIdentity) throw new Error('下载根目录已被替换');
     } catch (error) {
         const detail = error instanceof Error ? (error as NodeJS.ErrnoException).code ?? error.message : '删除失败';
-        throw new Error(`删除中止，已永久删除 ${deletedFiles} 个文件和 ${deletedDirectories} 个目录（${detail}）。`);
+        throw new Error(`删除中止，已永久删除 ${deletedFiles} 个文件和 ${deletedDirectories} 个目录（${detail}${currentPath ? `：${currentPath}` : ''}）。`);
     }
     return { deletedFiles, deletedDirectories };
 }

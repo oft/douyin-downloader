@@ -18,7 +18,7 @@ from core import (
     LoginRequiredError,
     URLParser,
 )
-from core.api_client import UserUnavailableError
+from core.api_client import BrowserPageAccessError, UserUnavailableError
 from core.browser_session import BrowserSession
 from core.downloader_base import DownloadResult
 from storage import Database, FileManager
@@ -34,6 +34,7 @@ AGENT_SUBCOMMAND = "agent"
 EXIT_ALL_FAILED = 1
 EXIT_LOGIN_REQUIRED = 3
 EXIT_ENVIRONMENT = 4
+EXIT_PAGE_ACCESS = 5
 
 
 def _as_bool(value: Any, default: bool = True) -> bool:
@@ -57,7 +58,7 @@ def _batch_exit_code(all_results, failed_urls: int, login_failed: bool):
     return None
 
 
-async def _run_with_relogin(make_coro, cookie_manager, *, serve=False, allow_relogin=True, progress_reporter=None):
+async def _run_with_relogin(make_coro, cookie_manager, *, serve=False, allow_relogin=True, progress_reporter=None, before_relogin=None):
     """Run make_coro(); on LoginRequiredError, relogin once and retry.
 
     make_coro is a zero-arg callable returning a fresh coroutine each call,
@@ -86,6 +87,8 @@ async def _run_with_relogin(make_coro, cookie_manager, *, serve=False, allow_rel
             reporter.print_warning(
                 f"检测到未登录（status {exc.status_code}），开始重新登录…"
             )
+            if before_relogin is not None:
+                await before_relogin()
             new_cookies = await interactive_relogin()
             if not new_cookies:
                 reporter.print_error("重新登录未完成。")
@@ -185,7 +188,7 @@ async def download_url(
         except UserUnavailableError as exc:
             output.print_warning(f"跳过用户主页 {url}：{exc.reason}")
             return DownloadResult()
-        except LoginRequiredError:
+        except (LoginRequiredError, BrowserUnavailableError, BrowserPageAccessError):
             # 交给 _run_with_relogin 重新登录后重试；恢复不了时由调用方记为该 URL 失败。
             raise
         except Exception as exc:
@@ -338,6 +341,7 @@ async def main_async(args, *, database_path=None, on_download_ready=None, progre
     failed_urls = 0
     login_failed = False
     browser_failed = False
+    page_access_failed = False
     progress_config = config.get("progress", {}) or {}
     quiet_by_config = _as_bool(progress_config.get("quiet_logs", True), default=True)
     quiet_progress_logs = quiet_by_config and not (args.verbose or args.show_warnings)
@@ -346,8 +350,10 @@ async def main_async(args, *, database_path=None, on_download_ready=None, progre
         # 默认静默控制台日志，下载完成后再恢复。
         set_console_log_level(logging.CRITICAL)
 
-    browser_session = BrowserSession()
+    browser_session = BrowserSession(profile_dir=Path("config/browser-profile"),
+                                     cookie_path=Path("config/cookies.json"))
     try:
+        await browser_session.initialize()
         # The library supplies its persistent scheduling policy; normal CLI order is unchanged.
         if url_scheduler is not None:
             urls = await url_scheduler.order(urls)
@@ -375,10 +381,17 @@ async def main_async(args, *, database_path=None, on_download_ready=None, progre
                         progress_reporter=reporter,
                         # 登录失败过一次就不再重新登录，免得每个 URL 都弹一次浏览器
                         allow_relogin=not login_failed,
+                        before_relogin=browser_session.release_for_login,
                     )
 
                 result = (await url_scheduler.run(url, process_url)
                           if url_scheduler is not None else await process_url())
+            except BrowserPageAccessError as exc:
+                page_access_failed = True
+                failed_urls += 1
+                reporter.print_error(str(exc))
+                reporter.fail_url(str(exc))
+                break
             except BrowserUnavailableError as exc:
                 browser_failed = True
                 reporter.print_error(str(exc))
@@ -420,6 +433,8 @@ async def main_async(args, *, database_path=None, on_download_ready=None, progre
     else:
         # 所有链接都失败时，也发通知（若启用）
         await _dispatch_notifications(config, None, len(urls))
+    if page_access_failed:
+        return EXIT_PAGE_ACCESS
     return EXIT_ENVIRONMENT if browser_failed else _batch_exit_code(all_results, failed_urls, login_failed)
 
 

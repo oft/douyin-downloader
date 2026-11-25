@@ -91,6 +91,7 @@ _BROWSER_USER_UNAVAILABLE_SCRIPT = """(messages) => {
             !element.closest('a, button, article, [data-e2e="user-info"], ' +
                 '[data-e2e="user-title"], [data-e2e="user-desc"], [data-e2e="user-signature"]'));
     const texts = nodes.map(element => (element.innerText || '').trim());
+    if (texts.some(text => /^服务异常(?:[，,。！!\\s].*)?$/.test(text))) return '网页服务异常';
     // 必须同时出现权限提示；不能仅凭简介写着“私密账号”就跳过。
     if (texts.includes('私密账号') &&
         texts.includes('发起关注请求，通过后即可查看该账号内容')) return '私密账号';
@@ -189,6 +190,10 @@ class LoginRequiredError(Exception):
         self.status_msg = status_msg
         self.path = path
         super().__init__(f"login required (status_code={status_code}) at {path}: {status_msg}")
+
+
+class BrowserPageAccessError(RuntimeError):
+    """The website cannot serve content; stop the batch rather than cycling profiles."""
 
 
 class UserUnavailableError(RuntimeError):
@@ -1993,6 +1998,9 @@ class DouyinAPIClient:
         last_page_sequence = -1
         stop_reason = "max_scrolls"
         stream_limit_reached = False
+        post_failure_reason = ""
+        post_failure_terminal = False
+        navigation_failure = ""
         deadline = browser_started + max(30, int(wait_timeout_seconds))
         self._browser_post_aweme_items = {}
         self._browser_post_stats = {}
@@ -2002,6 +2010,30 @@ class DouyinAPIClient:
                 if aweme_id and aweme_id not in seen:
                     seen.add(aweme_id)
                     ids.append(aweme_id)
+
+        def finish(reason=None, force_empty=False):
+            selected_ids = [] if force_empty else list(dict.fromkeys(post_api_ids + ids))
+            final_reason = reason or stop_reason
+            failure = post_failure_reason
+            if not selected_ids and not failure:
+                failure = {"page_closed": "浏览器页面已关闭",
+                           "navigation_mismatch": "页面跳转后未到达目标作者主页",
+                           "timeout": "浏览器采集等待已超时"}.get(final_reason, "") or navigation_failure
+                if not failure and not (post_api_page_hits and post_api_has_more is False):
+                    failure = "未收到作者作品分页数据，也未识别到作者作品列表中的作品链接"
+            self._browser_post_aweme_items = {} if force_empty else post_api_aweme_items
+            self._browser_post_stats = {
+                "merged_ids": len(ids), "post_api_ids": len(post_api_ids),
+                "dom_only_ids": len(set(ids) - post_api_seen),
+                "selected_ids": len(selected_ids), "post_items": len(post_api_aweme_items),
+                "post_pages": post_api_page_hits, "has_more": post_api_has_more,
+                "stop_reason": final_reason, "failure_reason": failure,
+                "complete": not force_empty and not failure and
+                (final_reason == "number_limit" or post_api_has_more is False),
+            }
+            logger.warning("浏览器作品采集结束：duration_ms=%s stats=%s",
+                           _elapsed_ms(browser_started), self._browser_post_stats)
+            return selected_ids
 
         logger.warning(
             "通过浏览器采集作品列表：target=%s expected_count=%s "
@@ -2018,22 +2050,60 @@ class DouyinAPIClient:
             pending_response_tasks: List[asyncio.Task] = []
 
             async def _handle_response(response, sequence):
-                nonlocal post_api_page_hits, post_api_has_more, last_page_sequence, stream_limit_reached
+                nonlocal post_api_page_hits, post_api_has_more, last_page_sequence, stream_limit_reached, post_failure_reason, post_failure_terminal
                 url = response.url or ""
                 if "/aweme/v1/web/aweme/post/" not in url:
                     return
                 response_user = parse_qs(urlsplit(url).query).get("sec_user_id", [None])[0]
                 if response_user is not None and response_user != sec_uid:
                     return
+                if getattr(getattr(response, "request", None), "method", "GET") in {"OPTIONS", "HEAD"}:
+                    return
+                if getattr(response, "status", 200) != 200:
+                    if sequence >= last_page_sequence:
+                        last_page_sequence = sequence
+                        post_api_has_more = None
+                        post_failure_reason = "作者作品分页请求返回 HTTP {}".format(response.status)
+                        post_failure_terminal = response.status in {401, 403, 429}
+                    return
                 try:
                     data = await response.json()
-                except Exception:
+                except Exception as error:
+                    if sequence >= last_page_sequence:
+                        last_page_sequence = sequence
+                        post_api_has_more = None
+                        headers = getattr(response, "headers", {}) or {}
+                        mime = re.match(r"[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+", str(headers.get("content-type", "")))
+                        kind = "正文已失效" if "resource with given identifier" in str(error).lower() else type(error).__name__
+                        post_failure_reason = "作品分页正文暂时无法读取或解析（HTTP 200，{}，{}）".format(
+                            mime.group(0) if mime else "响应类型未知", kind)
+                        post_failure_terminal = False
+                    return
+                if isinstance(data, dict) and data.get("status_code", 0) != 0:
+                    if sequence >= last_page_sequence:
+                        last_page_sequence = sequence
+                        post_api_has_more = None
+                        code = data.get("status_code")
+                        code = code if isinstance(code, int) else "未知"
+                        label = "提示未登录" if code in _LOGIN_REQUIRED_STATUS_CODES else "返回错误"
+                        post_failure_reason = "作者作品分页{}（状态码 {}）".format(label, code)
+                        post_failure_terminal = True
+                    return
+                if isinstance(data, dict) and (data.get("not_login_module") or data.get("verify_ticket")):
+                    if sequence >= last_page_sequence:
+                        last_page_sequence = sequence
+                        post_api_has_more = None
+                        post_failure_reason = ("作者作品分页要求完成安全验证" if data.get("verify_ticket")
+                                               else "作者作品分页返回未登录提示")
+                        post_failure_terminal = True
                     return
                 aweme_items = data.get("aweme_list") if isinstance(data, dict) else None
                 if isinstance(aweme_items, list) and data.get("status_code", 0) == 0:
                     post_api_page_hits += 1
                     if sequence >= last_page_sequence:
                         last_page_sequence = sequence
+                        post_failure_reason = ""
+                        post_failure_terminal = False
                         value = data.get("has_more")
                         post_api_has_more = bool(value) if value in (0, 1) else None
                     extracted: List[str] = []
@@ -2076,8 +2146,14 @@ class DouyinAPIClient:
 
             try:
                 try:
-                    await page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    navigation = await page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    if getattr(navigation, "status", 200) >= 400:
+                        post_failure_reason = "用户主页访问返回 HTTP {}".format(navigation.status)
+                        return finish("navigation_failed", True)
                 except Exception as exc:
+                    network = re.search(r"\bnet::(ERR_[A-Z0-9_]+)\b", str(exc))
+                    detail = network.group(0) if network else type(exc).__name__
+                    navigation_failure = "页面导航未完成（{}）".format(detail)
                     logger.warning(
                         "Browser goto timeout or error, continue with current page state: %s",
                         exc,
@@ -2085,7 +2161,7 @@ class DouyinAPIClient:
 
                 if urlsplit(str(getattr(page, "url", target_url))).path != urlsplit(target_url).path:
                     logger.warning("User page navigation did not reach the target; stale page ignored")
-                    return []
+                    return finish("navigation_failed" if navigation_failure else "navigation_mismatch", True)
 
                 title = ""
                 try:
@@ -2097,18 +2173,22 @@ class DouyinAPIClient:
                     title[:200],
                     safe_log_url(getattr(page, "url", target_url)),
                 )
-                if "验证码" in title:
+                if any(word in title for word in ("验证码", "安全验证", "验证后继续")):
                     if headless:
                         logger.warning(
                             "检测到验证码页面且当前为 headless 模式，无法人工验证。"
                             "请将 browser_fallback.headless 设为 false。"
                         )
-                        return []
+                        post_failure_reason = "页面出现安全验证，后台浏览器无法人工完成验证"
+                        return finish("verification", True)
                     logger.warning("检测到验证码页面，请在浏览器中完成验证，程序会自动继续采集。")
                     await self._wait_for_manual_verification(
                         page, wait_timeout_seconds=wait_timeout_seconds
                     )
                     if not page.is_closed():
+                        if any(word in await page.title() for word in ("验证码", "安全验证", "验证后继续")):
+                            post_failure_reason = "页面仍停留在安全验证，尚未取得作品列表"
+                            return finish("verification", True)
                         try:
                             await page.goto(
                                 target_url,
@@ -2127,7 +2207,7 @@ class DouyinAPIClient:
                         await self._check_browser_user_available(page)
                         _merge(await self._extract_aweme_ids_from_page(page))
                         await drain_responses()
-                        if ids:
+                        if ids or post_api_has_more is False or post_failure_terminal:
                             break
                         await page.wait_for_timeout(1000)
 
@@ -2146,15 +2226,34 @@ class DouyinAPIClient:
                         if stream_limit_reached:
                             stop_reason = "number_limit"
                             break
+                        if post_failure_terminal:
+                            stop_reason = "page_request_failed"
+                            break
+                        if post_api_has_more is False:
+                            stop_reason = "end_of_list"
+                            break
                         # Include responses arriving during scrolling/waiting in this round's growth.
                         before = len(ids)
                         await self._scroll_user_post_page(page)
-                        await page.wait_for_timeout(1200)
-                        await drain_responses()
-
-                        if not ids:
-                            await self._check_browser_user_available(page)
-                        _merge(await self._extract_aweme_ids_from_page(page))
+                        # Keep the normal 1.2s pacing. A slow page gets up to 8s before
+                        # this round is considered idle; new data/end-of-list ends the wait.
+                        for wait_round in range(18):
+                            await page.wait_for_timeout(1200 if wait_round == 0 else 400)
+                            await drain_responses()
+                            if not ids:
+                                await self._check_browser_user_available(page)
+                            _merge(await self._extract_aweme_ids_from_page(page))
+                            if (len(ids) > before or post_api_has_more is False
+                                    or stream_limit_reached or post_failure_terminal):
+                                break
+                            if time.monotonic() >= deadline:
+                                stop_reason = "timeout"
+                                break
+                        if stop_reason == "timeout":
+                            break
+                        if post_failure_terminal:
+                            stop_reason = "page_request_failed"
+                            break
                         if len(ids) == before:
                             stable_rounds += 1
                         else:
@@ -2169,9 +2268,12 @@ class DouyinAPIClient:
                         if stable_rounds >= idle_stop_rounds:
                             stop_reason = "idle"
                             break
-                except UserUnavailableError:
+                except (UserUnavailableError, BrowserPageAccessError):
                     raise
                 except Exception as exc:
+                    if page.is_closed():
+                        from utils.browser_runtime import BrowserUnavailableError
+                        raise BrowserUnavailableError("浏览器窗口已关闭，已停止本轮更新。") from exc
                     if on_items is not None:
                         raise  # Storage/queue failures must reach the supervisor.
                     stop_reason = "interrupted"
@@ -2206,36 +2308,7 @@ class DouyinAPIClient:
                 except Exception as exc:
                     logger.debug("Sync browser cookies skipped: %s", exc)
 
-        selected_ids: List[str] = []
-        selected_seen: set[str] = set()
-        for aweme_id in post_api_ids + ids:
-            if aweme_id and aweme_id not in selected_seen:
-                selected_seen.add(aweme_id)
-                selected_ids.append(aweme_id)
-        self._browser_post_aweme_items = post_api_aweme_items
-        self._browser_post_stats = {
-            "merged_ids": len(ids),
-            "post_api_ids": len(post_api_ids),
-            "selected_ids": len(selected_ids),
-            "post_items": len(post_api_aweme_items),
-            "post_pages": post_api_page_hits,
-            "has_more": post_api_has_more,
-            "stop_reason": stop_reason,
-            "complete": stop_reason == "number_limit" or post_api_has_more is False,
-        }
-        logger.warning(
-            "浏览器兜底采集 aweme_id: duration_ms=%s merged=%s from_post_api=%s "
-            "selected=%s post_items=%s post_pages=%s stop_reason=%s has_more=%s",
-            _elapsed_ms(browser_started),
-            len(ids),
-            len(post_api_ids),
-            len(selected_ids),
-            len(post_api_aweme_items),
-            post_api_page_hits,
-            stop_reason,
-            post_api_has_more,
-        )
-        return selected_ids
+        return finish()
 
     @asynccontextmanager
     async def _browser_page(self, *, headless):
@@ -2260,6 +2333,8 @@ class DouyinAPIClient:
             return
         if reason in _UNAVAILABLE_USER_MESSAGES:
             raise UserUnavailableError(reason)
+        if reason == "网页服务异常":
+            raise BrowserPageAccessError("抖音网页显示“服务异常”，已停止本轮更新；请稍后手动检查网页状态。")
 
     def pop_browser_post_aweme_items(self) -> Dict[str, Dict[str, Any]]:
         items = self._browser_post_aweme_items
@@ -2324,16 +2399,12 @@ class DouyinAPIClient:
     }
   };
 
-  const links = document.querySelectorAll("a[href]");
-  for (const node of links) {
+  const roots = document.querySelectorAll('[data-e2e="user-post-list"], [data-e2e="user-post-list-container"]');
+  for (const root of roots) for (const node of root.querySelectorAll("a[href]")) {
     const href = node.getAttribute("href") || "";
     collectFrom(href, /\\/video\\/(\\d{15,20})/g);
     collectFrom(href, /\\/note\\/(\\d{15,20})/g);
   }
-
-  const html = document.documentElement ? document.documentElement.innerHTML : "";
-  collectFrom(html, /"aweme_id":"(\\d{15,20})"/g);
-  collectFrom(html, /"group_id":"(\\d{15,20})"/g);
 
   return result;
 }
@@ -2357,7 +2428,7 @@ class DouyinAPIClient:
                 title = await page.title()
             except Exception:
                 pass
-            if "验证码" not in title:
+            if not any(word in title for word in ("验证码", "安全验证", "验证后继续")):
                 logger.warning("验证码页面已退出，继续采集。")
                 return
             await page.wait_for_timeout(1000)

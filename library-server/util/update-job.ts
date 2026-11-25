@@ -18,6 +18,7 @@ type UpdateStatus = {
 const exitErrors: Partial<Record<number, string>> = {
     3: '登录已失效，请更新下载器的登录信息后重试。',
     4: '下载运行环境未就绪。请查看进度中的具体原因，检查 Python 依赖、浏览器及 PYTHON_EXECUTABLE。',
+    5: '抖音网页显示服务异常，已停止本轮更新，请稍后手动检查网页状态。',
 };
 
 export function resolveUpdatePython(projectRoot: string, env: NodeJS.ProcessEnv = process.env) {
@@ -46,6 +47,10 @@ export class UpdateJob {
 
     get active() { return this.child !== undefined; }
     get status() { return this.current; }
+
+    send(input: unknown) {
+        if (this.child?.stdin?.writable) this.child.stdin.write(JSON.stringify(input) + '\n');
+    }
 
     start(input?: unknown) {
         if (this.child) return this.status;

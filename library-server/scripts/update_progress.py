@@ -84,7 +84,7 @@ class LibraryProgressDisplay(ProgressDisplay):
         self.snapshot.update(currentIndex=index, totalUrls=total, url=safe_log_url(url),
                              author="", step="初始化", detail="", itemsTotal=0,
                              itemsCompleted=0, bytesRead=0, bytesTotal=0, currentItem="",
-                             streaming=False, queuedItems=0, activeItems=0, listingState="")
+                             streaming=False, queuedItems=0, activeItems=0, listingState="", message="")
         self._emit(force=True)
 
     def _settle(self, result=None):

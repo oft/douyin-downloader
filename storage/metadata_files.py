@@ -38,7 +38,8 @@ async def _externalize_metadata(item):
     directory = file_path.parent if is_file else file_path
     names = await asyncio.to_thread(lambda: list(directory.iterdir()))
     work_id = str(record.get("aweme_id") or "")
-    related = [path for path in names if work_id and work_id in path.name]
+    related = [path for path in names if work_id and work_id in path.name
+               and not path.name.startswith("._")]
     if is_file:
         stem = file_path.stem
         if record.get("aweme_type") == "gallery":

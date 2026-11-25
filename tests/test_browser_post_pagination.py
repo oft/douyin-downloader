@@ -16,6 +16,7 @@ class Page:
         self.handlers = []
         self.url = "about:blank"
         self.waits = 0
+        self.waited_ms = 0
 
     def on(self, _event, callback):
         self.handlers.append(callback)
@@ -26,11 +27,18 @@ class Page:
     async def emit_page(self):
         if self.pages:
             data = self.pages.pop(0)
+            if data is None:
+                await asyncio.sleep(0)
+                return
             async def response_json():
+                if data.get("_json_error"):
+                    raise ValueError("fixture response body unavailable")
                 return data
             response = SimpleNamespace(
                 url="https://www.douyin.com/aweme/v1/web/aweme/post/?sec_user_id=test",
-                json=response_json)
+                status=data.get("_http_status", 200), json=response_json,
+                headers={"content-type": data.get("_content_type", "application/json")},
+                request=SimpleNamespace(method=data.get("_method", "GET")))
             for handler in self.handlers:
                 handler(response)
         await asyncio.sleep(0)
@@ -47,6 +55,7 @@ class Page:
 
     async def wait_for_timeout(self, _ms):
         self.waits += 1
+        self.waited_ms += _ms
         await self.emit_page()
 
 
@@ -83,7 +92,7 @@ async def test_response_growth_during_wait_does_not_count_as_idle(collector):
 async def test_stall_with_more_pages_is_incomplete_not_success(collector):
     client, page = collector([post_page(0)] * 20)
     ids = await client.collect_user_post_ids_via_browser("test", idle_rounds=3)
-    assert len(ids) == 18 and page.waits == 3
+    assert len(ids) == 18 and page.waited_ms == 24_000
     stats = client.pop_browser_post_stats()
     assert stats["complete"] is False and stats["has_more"] is True
     assert stats["stop_reason"] == "idle"
@@ -108,7 +117,7 @@ async def test_configured_number_limit_is_an_intentional_stop(collector):
 async def test_missing_pagination_end_flag_never_confirms_completion(collector):
     data = post_page(0)
     del data["has_more"]
-    client, _page = collector([data])
+    client, page = collector([data])
     await client.collect_user_post_ids_via_browser("test", idle_rounds=2)
     stats = client.pop_browser_post_stats()
     assert stats["complete"] is False and stats["has_more"] is None
@@ -179,3 +188,72 @@ async def test_streaming_storage_errors_propagate_and_remove_response_listener(c
     with pytest.raises(OSError):
         await client.collect_user_post_ids_via_browser("test", on_items=deliver)
     assert page.handlers == []
+
+
+async def test_slow_response_is_given_more_than_1_2_seconds_before_idle_stop(collector):
+    client, page = collector([post_page(0)] + [None] * 6 + [post_page(1, has_more=0)])
+    ids = await client.collect_user_post_ids_via_browser("test", max_scrolls=1, idle_rounds=1)
+    assert len(ids) == 36
+    assert 1200 < page.waited_ms < 8000
+    assert client.pop_browser_post_stats()["complete"] is True
+
+
+async def test_explicit_empty_last_page_is_not_a_browser_failure(collector):
+    client, page = collector([post_page(0, has_more=0, count=0)])
+    assert await client.collect_user_post_ids_via_browser("test") == []
+    stats = client.pop_browser_post_stats()
+    assert stats["complete"] is True and stats["failure_reason"] == ""
+    assert stats["stop_reason"] == "end_of_list" and page.waits == 0
+
+
+@pytest.mark.parametrize("data,reason", [
+    ({"status_code": 2483}, "未登录"),
+    ({"_http_status": 429}, "HTTP 429"),
+    ({"aweme_list": [], "has_more": 0, "not_login_module": {"text": "请登录"}}, "未登录"),
+])
+async def test_empty_collection_preserves_actual_page_failure_reason(collector, data, reason):
+    client, page = collector([data])
+    assert await client.collect_user_post_ids_via_browser("test", idle_rounds=1) == []
+    stats = client.pop_browser_post_stats()
+    assert stats["complete"] is False and reason in stats["failure_reason"]
+    assert page.waits == 0  # Known rejection should not spend the longer idle budget.
+
+
+async def test_failed_navigation_keeps_safe_diagnostics_even_on_early_return(collector):
+    client, page = collector([])
+    page.goto = AsyncMock(side_effect=RuntimeError("net::ERR_CONNECTION_RESET https://private/?token=secret"))
+    assert await client.collect_user_post_ids_via_browser("test") == []
+    stats = client.pop_browser_post_stats()
+    assert stats["stop_reason"] == "navigation_failed"
+    assert "net::ERR_CONNECTION_RESET" in stats["failure_reason"]
+    assert "secret" not in str(stats) and "private" not in str(stats)
+
+
+async def test_headless_verification_reason_survives_early_return(collector):
+    client, page = collector([])
+    page.title = AsyncMock(return_value="安全验证")
+    assert await client.collect_user_post_ids_via_browser("test", headless=True) == []
+    stats = client.pop_browser_post_stats()
+    assert stats["stop_reason"] == "verification"
+    assert "安全验证" in stats["failure_reason"]
+
+
+async def test_unreadable_response_does_not_abort_before_a_valid_response_arrives(collector):
+    client, page = collector([{"_json_error": True}, post_page(0, has_more=0)])
+    ids = await client.collect_user_post_ids_via_browser("test", idle_rounds=1)
+    assert len(ids) == 18 and page.waits > 0
+    stats = client.pop_browser_post_stats()
+    assert stats["complete"] is True and stats["failure_reason"] == ""
+
+
+async def test_non_json_response_keeps_sanitized_type_diagnostics(collector):
+    client, _page = collector([{"_json_error": True, "_content_type": "text/html; charset=utf-8"}])
+    assert await client.collect_user_post_ids_via_browser("test", max_scrolls=1, idle_rounds=1) == []
+    reason = client.pop_browser_post_stats()["failure_reason"]
+    assert "HTTP 200" in reason and "text/html" in reason and "ValueError" in reason
+    assert "fixture response" not in reason
+
+
+async def test_preflight_response_is_not_misclassified_as_author_post_data(collector):
+    client, _page = collector([{"_http_status": 403, "_method": "OPTIONS"}, post_page(0, has_more=0)])
+    assert len(await client.collect_user_post_ids_via_browser("test")) == 18

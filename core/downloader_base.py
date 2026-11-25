@@ -452,6 +452,8 @@ class BaseDownloader(ABC):
 
         if base_path.exists():
             for path in base_path.rglob("*"):
+                if path.name.startswith("._"):
+                    continue  # exFAT AppleDouble sidecars are not downloaded media.
                 if not path.is_file():
                     continue
                 if path.suffix.lower() not in self._local_media_suffixes:

@@ -33,6 +33,9 @@ const reviewFile = process.env.CATALOG_REVIEW_FILE ? path.resolve(process.env.CA
 const linkCheckJob = new LinkCheckJob(python, [
     '-u', path.join(directory, 'scripts', 'check-links.py'), configFile,
 ], projectRoot);
+const loginBrowser = new UpdateJob(python, [
+    '-u', path.join(directory, 'scripts', 'open-douyin.py'), configFile,
+], projectRoot);
 const reviewStatuses = ['pending', 'resolved', 'ignored'] as const;
 const sources: Source[] = ['post', 'like', 'mix', 'music', 'single', 'loose'];
 const textTypes: Record<string, string> = { 'index.html': 'text/html', 'app.js': 'text/javascript', 'profile-link.js': 'text/javascript', 'update-progress.js': 'text/javascript', 'link-check.js': 'text/javascript', 'styles.css': 'text/css' };
@@ -249,6 +252,7 @@ app.use('/api/catalog/link-check/*', requireLocalLinks);
 
 app.get('/api/catalog/link-check', c => c.json(linkCheckJob.status));
 app.post('/api/catalog/link-check/start', async c => {
+    if (loginBrowser.active) return c.json({ error: '请先关闭手动登录测试窗口，再开始链接检测；登录状态会自动保存。' }, 409);
     if (!/^application\/json(?:\s*;|$)/i.test(c.req.header('Content-Type') ?? '')) return c.json({ error: '需要 JSON 请求' }, 415);
     const body = await c.req.json().catch(() => null);
     if (!body || !Array.isArray(body.links) || !body.links.length || body.links.length > 1000
@@ -299,6 +303,7 @@ app.use('/api/catalog/update/*', async (c, next) => {
 
 app.get('/api/catalog/update', c => c.json(updateJob.status));
 app.post('/api/catalog/update/start', c => {
+    if (loginBrowser.active) return c.json({ error: '请先关闭手动登录测试窗口，再启动更新；登录状态会自动保存。' }, 409);
     if (updateJob.active) return c.json(updateJob.status, 202);
     if (linkCheckJob.active) return c.json({ error: '正在检测链接，请先停止检测或等待结束后再启动更新' }, 409);
     if (removing) return c.json({ error: '正在删除文件，请稍后再启动更新' }, 409);
@@ -308,6 +313,19 @@ app.post('/api/catalog/update/start', c => {
         }
     } catch (error) { return linkConfigFailure(c, error, '无法读取下载器配置'); }
     return c.json(updateJob.start(), 202);
+});
+
+app.get('/api/catalog/browser', c => {
+    if (!isLocalRequest(c)) return c.json({ error: '浏览器功能仅支持本机同源请求' }, 403);
+    return c.json(loginBrowser.status);
+});
+app.post('/api/catalog/browser/open', c => {
+    if (!isLocalRequest(c)) return c.json({ error: '浏览器功能仅支持本机同源请求' }, 403);
+    if (!/^application\/json(?:\s*;|$)/i.test(c.req.header('Content-Type') ?? '')) return c.json({ error: '需要 JSON 请求' }, 415);
+    if (updateJob.active || linkCheckJob.active) return c.json({ error: '更新或检测正在使用浏览器，请使用当前窗口，或停止任务后再打开测试窗口。' }, 409);
+    if (loginBrowser.active) loginBrowser.send({ action: 'focus' });
+    else loginBrowser.start();
+    return c.json(loginBrowser.status, 202);
 });
 app.post('/api/catalog/update/stop', c => c.json(updateJob.stop(), 202));
 

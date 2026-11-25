@@ -1114,6 +1114,19 @@ pager.addEventListener('submit', event => {
     goToPage(new FormData(event.target).get('page'));
 });
 byId('scan-button').addEventListener('click', () => void refreshStatus({ rescan: true }));
+byId('open-douyin').addEventListener('click', async () => {
+    const button = byId('open-douyin');
+    button.disabled = true;
+    try {
+        const result = await api('browser/open', { method: 'POST', headers: jsonHeaders, body: '{}' });
+        if (result.state === 'failed') throw new Error(result.error || '无法打开抖音');
+        showToast('已请求打开抖音，完成登录和保存选择后可关闭窗口，登录状态会自动保存。');
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        const current = await api('browser');
+        if (current.state === 'failed') throw new Error(current.error || '无法打开抖音');
+    } catch (error) { showToast(error.message, true); }
+    finally { button.disabled = false; }
+});
 byId('header-action').addEventListener('click', event => {
     const clear = event.target.closest('button[data-clear-author-works]');
     if (clear) void showRemoval('authors', clear.dataset.clearAuthorWorks, false, [], undefined, true);

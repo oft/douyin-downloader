@@ -43,6 +43,10 @@ config*.yml
 !config.example.yml
 .cookies.json
 config/cookies.json
+config/browser-profile/
+config/browser-state.json
+config/.browser-state.json.*.tmp
+config/.cookies.json.*.tmp
 .omx/
 
 # Editor / IDE local settings

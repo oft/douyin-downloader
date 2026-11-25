@@ -95,6 +95,16 @@ def test_streaming_totals_grow_without_resetting_completed_downloads():
     assert events[-1]["itemsCompleted"] == 0
 
 
+def test_next_author_does_not_inherit_previous_author_warning():
+    events = []
+    reporter = progress.LibraryProgressDisplay(events.append)
+    reporter.start_url(1, 2, "https://www.douyin.com/user/first")
+    reporter.print_warning("8条作品详情未能获取")
+    reporter.start_url(2, 2, "https://www.douyin.com/user/second")
+    assert events[-1]["message"] == ""
+    assert events[-1]["detail"] == ""
+
+
 @pytest.mark.asyncio
 async def test_progress_pipe_delivers_final_json_snapshot():
     stream = io.StringIO()
