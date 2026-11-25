@@ -279,6 +279,61 @@ def test_build_no_watermark_url_uses_h264_play_addr_variant(tmp_path):
     assert video_info[0] == "https://v3-web.douyinvod.com/note-h264.mp4"
 
 
+def test_video_candidates_choose_requested_quality_within_h264(tmp_path):
+    downloader = _build_video_downloader(tmp_path)
+    h264_720 = {"width": 720, "height": 1280, "url_list": ["https://cdn.example/avc-720"]}
+    h264_1080 = {"width": 1080, "height": 1920, "url_list": ["https://cdn.example/avc-1080"]}
+    bytevc2 = {"width": 1440, "height": 2560, "url_list": ["https://cdn.example/bytevc2"]}
+    aweme = {
+        "video": {
+            "bit_rate": [
+                {"is_bytevc1": 2, "bit_rate": 4_000_000, "play_addr": bytevc2},
+                {"is_bytevc1": 0, "bit_rate": 2_000_000, "play_addr": h264_1080},
+                {"is_bytevc1": "0", "bit_rate": 1_000_000, "play_addr": h264_720},
+            ]
+        }
+    }
+
+    for quality, expected in (("highest", h264_1080), ("720p", h264_720), ("lowest", h264_720)):
+        downloader.config.update(video_quality=quality)
+        assert [url for url, _ in downloader._build_video_url_candidates(aweme)] == [
+            *expected["url_list"],
+            *bytevc2["url_list"],
+        ]
+    downloader.config.update(video_quality="original")
+    assert [url for url, _ in downloader._build_video_url_candidates(aweme)] == bytevc2["url_list"]
+
+
+def test_video_candidates_use_named_h264_then_hevc_then_bytevc2(tmp_path):
+    downloader = _build_video_downloader(tmp_path)
+    h264 = "https://api-play.amemv.com/avc"
+    hevc = "https://cdn.example/hevc"
+    bytevc2 = "https://cdn.example/bytevc2"
+    video = {
+        "play_addr_h264": {"url_list": [h264]},
+        "bit_rate": [
+            {"is_bytevc1": 2, "bit_rate": 4_000_000, "play_addr": {"url_list": [bytevc2]}},
+            {"is_bytevc1": 1, "bit_rate": 2_000_000, "play_addr": {"url_list": [hevc]}},
+        ],
+    }
+
+    assert [url for url, _ in downloader._build_video_url_candidates({"video": video})] == [
+        h264,
+        hevc,
+        bytevc2,
+    ]
+    hevc_only = {**video, "bit_rate": [video["bit_rate"][1]]}
+    assert [url for url, _ in downloader._build_video_url_candidates({"video": hevc_only})] == [
+        h264,
+        hevc,
+    ]
+    video.pop("play_addr_h264")
+    assert [url for url, _ in downloader._build_video_url_candidates({"video": video})] == [
+        hevc,
+        bytevc2,
+    ]
+
+
 def test_signed_fallback_uses_selected_highest_ratio(tmp_path):
     downloader = _build_video_downloader(tmp_path)
     play_addr = {"uri": "hd", "url_list": ["https://x/playwm"]}

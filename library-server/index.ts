@@ -16,12 +16,15 @@ import type { ReviewStatus } from './util/reviews.ts';
 import { deletePermanently, removalPlan } from './util/library-files.ts';
 import type { RemovalKind } from './util/library-files.ts';
 import { resolveUpdatePython, UpdateJob } from './util/update-job.ts';
+import { createHeifPreview, isoImageType } from './util/browser-image.ts';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.dirname(directory);
 const configFile = process.env.CONFIG_PATH ? path.resolve(process.env.CONFIG_PATH) : path.join(projectRoot, 'config.yml');
 const { downloadRoot, databaseFile } = readLibraryConfig(configFile);
-const updateJob = new UpdateJob(resolveUpdatePython(projectRoot), [
+const python = resolveUpdatePython(projectRoot);
+const heifPreview = createHeifPreview(python, projectRoot);
+const updateJob = new UpdateJob(python, [
     '-u', path.join(directory, 'scripts', 'update-library.py'), configFile, downloadRoot, databaseFile,
 ], projectRoot);
 const reviewFile = process.env.CATALOG_REVIEW_FILE ? path.resolve(process.env.CATALOG_REVIEW_FILE) : path.join(directory, 'data', 'catalog-reviews.json');
@@ -143,6 +146,8 @@ function publicWork({ search, copies, metadataPath, downloadTime, ...work }: Cat
 
 async function streamAsset(c: Context, root: string, relativePath: string) {
     const requested = path.join(root, ...relativePath.split('/'));
+    let contentType = mediaTypes[path.extname(relativePath).toLowerCase()] ?? 'application/octet-stream';
+    let preview: Buffer | undefined;
     let handle;
     let size;
     try {
@@ -156,12 +161,24 @@ async function streamAsset(c: Context, root: string, relativePath: string) {
             return c.notFound();
         }
         size = details.size;
+        if (contentType.startsWith('image/')) {
+            const header = Buffer.alloc(64);
+            const { bytesRead } = await handle.read(header, 0, header.length, 0);
+            contentType = isoImageType(header.subarray(0, bytesRead)) ?? contentType;
+            if (contentType === 'image/heic') {
+                preview = await heifPreview(resolved);
+                if (preview) {
+                    contentType = 'image/jpeg';
+                    size = preview.length;
+                }
+            }
+        }
     } catch {
         await handle?.close();
         return c.notFound();
     }
 
-    const headers = new Headers({ 'Accept-Ranges': 'bytes', 'Content-Type': mediaTypes[path.extname(relativePath).toLowerCase()] ?? 'application/octet-stream',
+    const headers = new Headers({ 'Accept-Ranges': 'bytes', 'Content-Type': contentType,
         'Cache-Control': 'private, no-cache', 'X-Content-Type-Options': 'nosniff' });
     let start = 0;
     let end = size - 1;
@@ -185,6 +202,10 @@ async function streamAsset(c: Context, root: string, relativePath: string) {
     if (c.req.method === 'HEAD') {
         await handle.close();
         return new Response(null, { status: range ? 206 : 200, headers });
+    }
+    if (preview) {
+        await handle.close();
+        return new Response(Uint8Array.from(preview.subarray(start, end + 1)), { status: range ? 206 : 200, headers });
     }
     const stream = Readable.toWeb(handle.createReadStream({ start, end }));
     return new Response(stream as unknown as BodyInit, { status: range ? 206 : 200, headers });

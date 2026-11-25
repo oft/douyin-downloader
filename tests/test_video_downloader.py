@@ -77,6 +77,14 @@ def test_extract_video_cover_urls_falls_back_to_preview_cover():
     assert extract_video_cover_urls(aweme) == ["https://example.com/preview.jpg"]
 
 
+def test_extract_video_cover_urls_prefers_jpeg_over_heic_for_same_cover():
+    heic = "https://cover.example/original.heic?version=1"
+    jpeg = "https://cover.example/original.jpeg?version=1"
+    aweme = {"video": {"origin_cover": {"url_list": [heic, jpeg]}}}
+
+    assert extract_video_cover_urls(aweme) == [jpeg, heic]
+
+
 @pytest.mark.asyncio
 async def test_video_downloader_skip_counts_total(tmp_path, monkeypatch):
     downloader, api_client = _build_downloader(tmp_path)

@@ -34,7 +34,8 @@ def extract_video_cover_urls(aweme: Optional[Mapping[str, Any]]) -> List[str]:
     Douyin exposes both preview-sized ``video.cover`` and higher-quality
     variants. Prefer ``origin_cover`` (the original static cover), then the
     occasionally returned ``cover_original_scale``, and retain ``cover`` as a
-    compatibility fallback for older payloads.
+    compatibility fallback for older payloads. Within one cover, keep HEIF
+    mirrors behind the alternatives so browsers can display common formats.
     """
 
     if not isinstance(aweme, Mapping):
@@ -52,7 +53,12 @@ def extract_video_cover_urls(aweme: Optional[Mapping[str, Any]]) -> List[str]:
             continue
         urls = [item for item in url_list if isinstance(item, str) and item]
         if urls:
-            return urls
+            return sorted(
+                urls,
+                key=lambda url: url.split("?", 1)[0].split("#", 1)[0].lower().endswith(
+                    (".heic", ".heif")
+                ),
+            )
     return []
 
 

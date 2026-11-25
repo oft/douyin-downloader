@@ -1259,17 +1259,32 @@ class BaseDownloader(ABC):
     ) -> List[Tuple[str, Dict[str, str]]]:
         """按优先级返回可依次尝试的视频下载地址（url + 请求头）。
 
-        直连 CDN（douyinvod.com 等）优先于 ``/aweme/v1/play/`` 签名端点：
+        普通画质按编码优先级挑档。同一档位内，直连 CDN（douyinvod.com 等）
+        优先于 ``/aweme/v1/play/`` 签名端点：
         play 端点 302 后可能落到打不通的 PCDN 节点（``*.qtaeixd.com`` 高位
         端口），直连域名走标准 CDN（commit 099aae5 声明的意图，此前被循环
         内对 douyin.com 候选的提前 return 打破）。play 端点保留为降级候选，
         供直连失败时兜底。没有净版候选时按旧逻辑回退：uri 构造签名地址 →
         带水印地址。
         """
-        video = aweme_data.get("video", {})
+        video = aweme_data.get("video")
+        if not isinstance(video, dict):
+            return []
         quality = str(self.config.get("video_quality") or "highest")
-        play_addr = self._pick_preferred_play_addr(video, quality) or {}
-        url_candidates = [c for c in (play_addr.get("url_list") or []) if c]
+        paid = is_paid_content(aweme_data)
+        candidates = []
+        seen = set()
+        for play_addr in self._video_play_addrs(video, quality):
+            for url, headers in self._video_candidates_for_address(video, play_addr, quality, paid):
+                if url not in seen:
+                    seen.add(url)
+                    candidates.append((url, headers))
+        return candidates
+
+    def _video_candidates_for_address(
+        self, video: Dict[str, Any], play_addr: Dict[str, Any], quality: str, paid: bool
+    ) -> List[Tuple[str, Dict[str, str]]]:
+        url_candidates = self._extract_urls(play_addr)
         url_candidates.sort(key=lambda u: 0 if "watermark=0" in u else 1)
 
         direct_candidates, play_candidate, watermarked_candidate = self._partition_video_candidates(
@@ -1282,9 +1297,7 @@ class BaseDownloader(ABC):
         if candidates:
             return candidates
 
-        constructed = self._build_signed_play_url(
-            video, play_addr, quality, paid=is_paid_content(aweme_data)
-        )
+        constructed = self._build_signed_play_url(video, play_addr, quality, paid=paid)
         if constructed:
             return [constructed]
         if watermarked_candidate:
@@ -1618,6 +1631,53 @@ class BaseDownloader(ABC):
             ):
                 return candidate
         return None
+
+    @staticmethod
+    def _video_play_addrs(video: Dict[str, Any], quality: str) -> List[Dict[str, Any]]:
+        legacy = BaseDownloader._pick_preferred_play_addr(video, quality) or {}
+        if quality.strip().lower() == "original":
+            return [legacy]
+
+        # is_bytevc1 is a codec selector: 0 = H.264, 1 = HEVC, 2 = ByteVC2.
+        by_codec: Dict[str, List[Dict[str, Any]]] = {"0": [], "1": [], "2": [], "other": []}
+        bit_rates = video.get("bit_rate")
+        if isinstance(bit_rates, list):
+            for entry in bit_rates:
+                if not isinstance(entry, dict):
+                    continue
+                address = entry.get("play_addr")
+                if not isinstance(address, dict) or not (
+                    BaseDownloader._extract_first_url(address) or address.get("uri")
+                ):
+                    continue
+                codec = str(entry.get("is_bytevc1"))
+                by_codec.get(codec, by_codec["other"]).append(entry)
+
+        def best(codec: str) -> Optional[Dict[str, Any]]:
+            return BaseDownloader._pick_play_addr_by_quality({"bit_rate": by_codec[codec]}, quality)
+
+        def named(key: str) -> Optional[Dict[str, Any]]:
+            address = video.get(key)
+            if isinstance(address, dict) and (
+                BaseDownloader._extract_first_url(address) or address.get("uri")
+            ):
+                return address
+            return None
+
+        h264 = best("0")
+        hevc = best("1")
+        bytevc2 = best("2")
+        # Untagged legacy responses retain the existing primary address order.
+        if h264 is None and hevc is None and bytevc2 is None:
+            return [legacy]
+
+        h264 = h264 or named("play_addr_h264")
+        other = hevc or best("other") or named("play_addr_265")
+        addresses = []
+        for address in (h264, other, bytevc2 or legacy):
+            if address and address not in addresses:
+                addresses.append(address)
+        return addresses
 
     @staticmethod
     def _has_video_source(video: Dict[str, Any]) -> bool:
