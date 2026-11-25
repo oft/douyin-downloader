@@ -1,0 +1,2 @@
+deployment/launchd-socket
+deployment/*.log

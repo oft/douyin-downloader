@@ -1,0 +1,45 @@
+{
+  "https": 200,
+  "videoTotal": 3013,
+  "rangeStatus": 206,
+  "rangeBytes": 16,
+  "idleTestMs": 15000,
+  "idleStopped": true,
+  "newProcessOnRevisit": true,
+  "checkedOn": "2026-11-26",
+  "productionIdleMs": 1200000,
+  "browser": {
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "scrollWidth": 390,
+      "feedHeight": 782,
+      "slideHeight": 782,
+      "playing": 1,
+      "videoSources": 2
+    },
+    "touchSwipe": {
+      "scrollTop": 782,
+      "height": 782,
+      "playing": 1
+    },
+    "pageErrors": [],
+    "favorites": true,
+    "sound": true,
+    "seek": true,
+    "desktop": true,
+    "soundChoiceSurvivesReload": true,
+    "explicitMuteRespected": true,
+    "autoplayDeniedFallback": true,
+    "enableSoundGesture": true,
+    "transitionMs": 168,
+    "wheelOneVideoPerGesture": true
+  },
+  "checks": {
+    "videoWebTests": 6,
+    "pythonPassed": 1363,
+    "pythonSkipped": 1,
+    "ruff": "passed",
+    "syntax": "passed"
+  }
+}
