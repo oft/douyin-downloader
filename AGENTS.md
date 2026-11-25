@@ -97,3 +97,11 @@ A Python-based Douyin (TikTok China) batch downloader that fetches videos, galle
 - `openai-whisper` — audio transcription
 
 <!-- MANUAL: -->
+
+## Fork development workflow
+
+- The fork remote is `origin`, pointing to https://github.com/oft/douyin-downloader.git.
+- The original project remote is `upstream`, pointing to https://github.com/jiji262/douyin-downloader.git.
+- Use `dev` for this fork's development and integration work.
+- When incorporating upstream updates, run `git fetch upstream`, switch to `dev`, and merge `upstream/main`. Resolve conflicts while preserving the CLI browser login fix, then validate and push `dev` to `origin`.
+- The CLI intentionally keeps configured login cookies in its browser fallback. This behavior is maintained in `cli/main.py` and covered by `tests/test_cli_main.py`.

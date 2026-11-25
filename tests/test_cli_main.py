@@ -205,3 +205,37 @@ async def test_download_url_warns_when_comments_are_incomplete(monkeypatch, tmp_
 
     assert result.failed == 0
     assert warnings == [note]
+
+
+@pytest.mark.asyncio
+async def test_download_url_preserves_login_cookies_for_browser_fallback(monkeypatch, tmp_path):
+    from core.api_client import DouyinAPIClient
+
+    class OfflineAPIClient(DouyinAPIClient):
+        async def __aenter__(self):
+            return self
+
+    cookies = {"sessionid": "test-session", "sid_guard": "test-guard", "ttwid": "test-id"}
+    manager = SimpleNamespace(get_cookies=lambda: cookies)
+    captured = {}
+
+    def create_downloader(_url_type, _config, api_client, *_args, **_kwargs):
+        captured["browser_cookies"] = {
+            item["name"]: item["value"] for item in api_client._browser_cookie_payload()
+        }
+        return _FakeDownloader()
+
+    config = main_module.ConfigLoader()
+    config.update(path=str(tmp_path))
+    monkeypatch.setattr(main_module, "DouyinAPIClient", OfflineAPIClient)
+    monkeypatch.setattr(main_module.DownloaderFactory, "create", create_downloader)
+
+    result = await main_module.download_url(
+        "https://www.douyin.com/user/test-user",
+        config,
+        manager,
+    )
+
+    assert result.success == 1
+    assert captured["browser_cookies"] == cookies
+    assert "sessionid" in DouyinAPIClient._BROWSER_COOKIE_BLOCKLIST
