@@ -627,11 +627,15 @@ function renderPreview(work) {
 }
 
 async function showWork(id, listPage) {
-    const version = openModal('正在读取作品…', 'work-modal');
-    workPreview = { id, listPage, loadingPage: false };
+    const previous = workPreview;
+    const switching = modal.open && modal.classList.contains('work-modal') && Boolean(modal.querySelector('[data-remove-work]'));
+    // Keep the current player and dialog geometry while the next work is fetched.
+    const version = switching ? ++modalVersion : openModal('正在读取作品…', 'work-modal');
+    workPreview = { id, listPage, loadingPage: false, loadingWork: true };
     try {
         const work = await api(`works/${encodeURIComponent(id)}`);
         if (version !== modalVersion || !modal.open) return;
+        clearModalBody();
         byId('modal-title').textContent = work.title;
         byId('modal-subtitle').textContent = [kindNames[work.kind], work.time, work.platformId].filter(Boolean).join('　·　');
         const copies = work.copies.map(copy => `<li><div><strong>${sourceNames[copy.source] ?? escape(copy.source)}</strong><code class="path">${escape(copy.localPath)}</code></div><button type="button" class="plain" data-copy="${escape(copy.localPath)}">复制路径</button></li>`).join('');
@@ -665,13 +669,20 @@ async function showWork(id, listPage) {
             byId('album-next').addEventListener('click', () => change(1));
         }
     } catch (error) {
-        if (version === modalVersion && modal.open) byId('modal-body').innerHTML = box('作品无法打开', error.message);
+        if (version === modalVersion && modal.open) {
+            if (switching) {
+                workPreview = previous;
+                showToast(`无法切换作品：${error.message}`, true);
+            } else byId('modal-body').innerHTML = box('作品无法打开', error.message);
+        }
+    } finally {
+        if (version === modalVersion && workPreview) workPreview.loadingWork = false;
     }
 }
 
 async function stepWorkPreview(step) {
     const preview = workPreview;
-    if (!preview?.listPage || preview.loadingPage) return;
+    if (!preview?.listPage || preview.loadingPage || preview.loadingWork) return;
     const { data, params } = preview.listPage;
     const index = data.items.findIndex(work => work.id === preview.id);
     if (index < 0) return;
