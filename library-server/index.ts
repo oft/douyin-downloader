@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { createHash } from 'node:crypto';
 import { profileIdFromLink } from './public/profile-link.js';
-import type { Context } from 'hono';
+import type { Context, MiddlewareHandler } from 'hono';
 import { open, readFile, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
@@ -14,6 +14,7 @@ import type { Catalog, DatabaseCatalog, Source, Work } from './util/catalog.ts';
 import { ReviewStore } from './util/reviews.ts';
 import type { ReviewStatus } from './util/reviews.ts';
 import { deletePermanently, removalPlan } from './util/library-files.ts';
+import type { RemovalKind } from './util/library-files.ts';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const configFile = process.env.CONFIG_PATH ? path.resolve(process.env.CONFIG_PATH) : path.join(directory, '..', 'config.yml');
@@ -36,6 +37,8 @@ const mediaPaths = new Map<string, { root: string; relativePath: string }>();
 async function fileStamp(file: string, optional = false) {
     try {
         const info = await stat(file, { bigint: true });
+        // A read-only SQLite connection can create an empty WAL without changing any records.
+        if (optional && info.size === 0n) return '';
         return `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs ?? info.mtimeMs}:${info.ctimeNs ?? info.ctimeMs}`;
     } catch (error) {
         if (optional && (error as NodeJS.ErrnoException).code === 'ENOENT') return '';
@@ -198,10 +201,13 @@ function linkConfigFailure(c: Context, error: unknown, message: string) {
     return error instanceof LinkConfigError ? c.json({ error: error.message }, error.status) : c.json({ error: message }, 500);
 }
 
-app.use('/api/catalog/links', async (c, next) => {
+const requireLocalLinks: MiddlewareHandler = async (c, next) => {
     if (!isLocalRequest(c)) return c.json({ error: '链接管理仅支持本机同源请求' }, 403);
     await next();
-});
+};
+
+app.use('/api/catalog/links', requireLocalLinks);
+app.use('/api/catalog/authors/:id/links', requireLocalLinks);
 
 app.get('/api/catalog/link-authors', c => {
     if (!isLocalRequest(c)) return c.json({ error: '链接管理仅支持本机同源请求' }, 403);
@@ -215,13 +221,13 @@ app.get('/api/catalog/links', c => {
 });
 
 app.put('/api/catalog/links', async c => {
-    if (removing) return c.json({ error: '正在删除文件，请稍后再保存链接' }, 409);
     if (!/^application\/json(?:\s*;|$)/i.test(c.req.header('Content-Type') ?? '')) return c.json({ error: '需要 JSON 请求' }, 415);
     const body = await c.req.json().catch(() => null);
     if (!body || typeof body.revision !== 'string' || !/^[a-f0-9]{64}$/.test(body.revision) ||
         !Array.isArray(body.links) || !body.links.every((link: unknown) => typeof link === 'string' && Boolean(link.trim()))) {
         return c.json({ error: '每条链接都应填写非空文本' }, 400);
     }
+    if (removing) return c.json({ error: '正在删除文件，请稍后再保存链接' }, 409);
     try { return c.json(saveConfigLinks(configFile, body.links, body.revision)); }
     catch (error) { return linkConfigFailure(c, error, '无法保存下载器配置，请检查文件权限'); }
 });
@@ -270,6 +276,45 @@ app.get('/api/catalog/authors/:id', c => browseDatabase(c, async snapshot => {
     return author ? c.json((await authorsWithMedia(snapshot, [author]))[0]) : c.json({ error: '数据库中没有此作者' }, 404);
 }));
 
+function planAuthorLinks(authorKeys: (string | undefined)[]) {
+    const config = readConfigLinks(configFile);
+    const keys = new Set(authorKeys.filter(Boolean));
+    const matches: string[] = [];
+    const remaining: string[] = [];
+    for (const link of config.links) {
+        const list = keys.has(profileIdFromLink(link)) ? matches : remaining;
+        list.push(link);
+    }
+    return { config, matches, remaining };
+}
+
+app.get('/api/catalog/authors/:id/links', c => browseDatabase(c, snapshot => {
+    const author = snapshot.authorById.get(c.req.param('id'));
+    if (!author) return c.json({ error: '数据库中没有此作者' }, 404);
+    try {
+        const { config, matches } = planAuthorLinks([author.sharedKey]);
+        return c.json({ name: author.name, links: matches, revision: config.revision });
+    } catch (error) { return linkConfigFailure(c, error, '无法读取下载器配置'); }
+}));
+
+app.delete('/api/catalog/authors/:id/links', async c => {
+    if (!/^application\/json(?:\s*;|$)/i.test(c.req.header('Content-Type') ?? '')) return c.json({ error: '需要 JSON 请求' }, 415);
+    const body = await c.req.json().catch(() => null);
+    if (typeof body?.revision !== 'string' || !/^[a-f0-9]{64}$/.test(body.revision)) {
+        return c.json({ error: '请重新读取并确认要删除的链接' }, 400);
+    }
+    return browseDatabase(c, snapshot => {
+        if (removing) return c.json({ error: '正在删除文件，请稍后再保存链接' }, 409);
+        const author = snapshot.authorById.get(c.req.param('id'));
+        if (!author) return c.json({ error: '数据库中没有此作者' }, 404);
+        try {
+            const { matches, remaining } = planAuthorLinks([author.sharedKey]);
+            saveConfigLinks(configFile, remaining, body.revision);
+            return c.json({ removedLinks: matches.length });
+        } catch (error) { return linkConfigFailure(c, error, '无法保存下载器配置，请检查文件权限'); }
+    });
+});
+
 app.get('/api/catalog/works', c => browseDatabase(c, snapshot => {
     const q = getQuery(c);
     const { author, kind, source } = c.req.query();
@@ -303,12 +348,13 @@ app.get('/api/catalog/works/:id', c => browseDatabase(c, async snapshot => {
         copies: work.copies.map(({ flatFiles, ...copy }) => copy) });
 }));
 
-async function inspectRemoval(snapshot: DatabaseCatalog, kind: 'works' | 'authors', id: string) {
-    const work = kind === 'works' ? snapshot.workById.get(id) : undefined;
-    const works = work ? [work] : kind === 'authors' ? snapshot.works.filter(item => item.authorId === id) : [];
+async function planRemoval(snapshot: DatabaseCatalog, kind: RemovalKind, ids: string[]) {
+    if (kind === 'authors' && ids.some(id => !snapshot.authorById.has(id))) return undefined;
+    const selected = new Set(ids);
+    const isSelected = (work: Work) => selected.has((kind === 'authors' ? work.authorId : work.id) ?? '');
+    const works = snapshot.works.filter(isSelected);
     const local = await inspectWorks(snapshot, works);
-    const author = kind === 'authors' ? snapshot.authorById.get(id) : undefined;
-    if (author) local.authorById.set(id, author);
+    if (kind === 'authors') for (const id of ids) local.authorById.set(id, snapshot.authorById.get(id)!);
     // Missing local media still belongs to the confirmed database deletion scope.
     for (const item of works) {
         if (!local.workById.has(item.id)) {
@@ -317,86 +363,113 @@ async function inspectRemoval(snapshot: DatabaseCatalog, kind: 'works' | 'author
             local.workById.set(item.id, missing);
         }
     }
-    return local;
+    const rootName = path.basename(snapshot.root).toLowerCase();
+    const protectedPaths = kind === 'authors' ? snapshot.works.filter(item => !isSelected(item)).flatMap(item => item.copies.flatMap(copy => {
+        const parts = copy.path.split('/');
+        const legacy = parts.length > 1 && parts[0]?.toLowerCase() === rootName;
+        return legacy ? [copy.path, parts.slice(1).join('/')] : [copy.path];
+    })) : [];
+    const plan = await removalPlan(local, kind, ids, protectedPaths);
+    if (!plan) return undefined;
+    const linkPlan = kind === 'authors' ? planAuthorLinks(ids.map(id => snapshot.authorById.get(id)?.sharedKey)) : undefined;
+    if (plan.view.token && linkPlan) {
+        plan.view.token = createHash('sha256').update(JSON.stringify([plan.view.token, linkPlan.config.revision])).digest('hex');
+    }
+    return { local, plan, linkPlan };
 }
 
-async function planRemoval(snapshot: DatabaseCatalog, kind: 'works' | 'authors', id: string) {
-    const local = await inspectRemoval(snapshot, kind, id);
-    const plan = await removalPlan(local, kind, id);
-    const links = kind === 'authors' && plan ? readConfigLinks(configFile) : undefined;
-    const authorKey = snapshot.authorById.get(id)?.sharedKey;
-    const remainingLinks = links?.links.filter(link => !authorKey || profileIdFromLink(link) !== authorKey);
-    const removedLinks = links ? links.links.length - remainingLinks!.length : 0;
-    if (plan && links && plan.view.token) {
-        plan.view.token = createHash('sha256').update(JSON.stringify([plan.view.token, links.revision])).digest('hex');
-    }
-    return { local, plan, links, remainingLinks, removedLinks };
+function previewRemoval(c: Context, kind: RemovalKind, ids: string[]) {
+    return browseDatabase(c, async snapshot => {
+        if (removing) return c.json({ error: '正在删除文件，请稍后再查看' }, 409);
+        try {
+            const result = await planRemoval(snapshot, kind, ids);
+            return result ? c.json({ ...result.plan.view, removedLinks: result.linkPlan?.matches.length ?? 0 })
+                : c.json({ error: '部分选择已不存在，请刷新列表后重新选择' }, 404);
+        } catch (error) { return linkConfigFailure(c, error, '无法读取删除范围或下载器配置'); }
+    });
 }
+
+async function commitRemoval(c: Context, kind: RemovalKind, ids: string[], token: string) {
+    if (scan || removing) return c.json({ error: '索引正在更新，请稍后再试' }, 409);
+    removing = true;
+    let attempted = false;
+    let affectedWorks: string[] = [];
+    let affectedAssets: string[] = [];
+    let mediaRoot = downloadRoot;
+    let deleted;
+    let failure;
+    let removedLinks = 0;
+    let linkChange: { before: ReturnType<typeof readConfigLinks>; saved: ReturnType<typeof saveConfigLinks> } | undefined;
+    try {
+        const snapshot = await loadDatabaseCatalog();
+        const result = await planRemoval(snapshot, kind, ids);
+        if (!result) return c.json({ error: '部分选择已不存在，请刷新列表后重新选择' }, 404);
+        const { local, plan, linkPlan } = result;
+        if (plan.view.token !== token || await loadDatabaseCatalog() !== snapshot) {
+            return c.json({ error: '文件或作品记录已变更，请重新查看删除范围' }, 409);
+        }
+        affectedWorks = local.works.flatMap(work => work.platformId ? [work.platformId] : []);
+        affectedAssets = [...local.assets.keys()];
+        mediaRoot = local.root;
+        // Save first so an unwritable configuration cannot leave media already deleted.
+        if (linkPlan?.matches.length) {
+            const { config, remaining, matches } = linkPlan;
+            const saved = saveConfigLinks(configFile, remaining, config.revision);
+            linkChange = { before: config, saved };
+            removedLinks = matches.length;
+        }
+        attempted = true;
+        deleted = await deletePermanently(local.root, plan.units);
+    } catch (error) {
+        failure = error instanceof Error ? (error as NodeJS.ErrnoException).code ?? error.message : '操作失败';
+    } finally {
+        if (linkChange && !deleted) {
+            try { saveConfigLinks(configFile, linkChange.before.links, linkChange.saved.revision); }
+            catch { failure = `${failure ?? '删除未完成'}；配置链接恢复失败，请重新读取链接配置`; }
+        }
+        if (attempted) {
+            try { await reconcileDeletedWorks(databaseFile, mediaRoot, affectedWorks); }
+            catch (error) { failure ??= error instanceof Error ? error.message : '数据库更新失败'; }
+            databaseView = undefined;
+            catalog = undefined;
+            scanError = undefined;
+            for (const asset of affectedAssets) mediaPaths.delete(asset);
+        }
+        removing = false;
+    }
+    return failure ? c.json({ error: failure }, 409) : c.json({ ...deleted, removedLinks, ...await currentStatus() });
+}
+
+function isRemovalToken(body: unknown): body is { mode: 'permanent'; token: string } {
+    const request = body as { mode?: unknown; token?: unknown } | null;
+    return request?.mode === 'permanent' && typeof request.token === 'string' && /^[a-f0-9]{64}$/.test(request.token);
+}
+
+function authorSelection(value: unknown): string[] | undefined {
+    if (!Array.isArray(value) || !value.length || !value.every(id => typeof id === 'string' && /^[a-f0-9]{24}$/.test(id))) return undefined;
+    return [...new Set<string>(value)].sort();
+}
+
+const batchRemovalPath = '/api/catalog/authors/batch-removal';
+app.on(['POST', 'DELETE'], batchRemovalPath, async c => {
+    if (!isLocalRequest(c)) return c.json({ error: '删除功能仅支持本机同源请求' }, 403);
+    if (!/^application\/json(?:\s*;|$)/i.test(c.req.header('Content-Type') ?? '')) return c.json({ error: '需要 JSON 请求' }, 415);
+    const body = await c.req.json().catch(() => null);
+    const ids = authorSelection(body?.ids);
+    if (!ids) return c.json({ error: '请选择要删除的作者' }, 400);
+    if (c.req.method === 'POST') return previewRemoval(c, 'authors', ids);
+    if (!isRemovalToken(body)) return c.json({ error: '请查看删除清单并确认永久删除' }, 400);
+    return commitRemoval(c, 'authors', ids, body.token);
+});
 
 for (const kind of ['works', 'authors'] as const) {
-    app.get(`/api/catalog/${kind}/:id/${kind === 'works' ? 'files' : 'removal'}`, c => browseDatabase(c, async snapshot => {
-        if (removing) return c.json({ error: '正在删除文件，请稍后再查看' }, 409);
-        const id = c.req.param('id');
-        try {
-            const { plan, removedLinks } = await planRemoval(snapshot, kind, id);
-            return plan ? c.json({ ...plan.view, removedLinks }) : c.json({ error: '没有找到可检查的本地副本' }, 404);
-        } catch (error) { return linkConfigFailure(c, error, '无法读取删除范围或下载器配置'); }
-    }));
-
+    app.get(`/api/catalog/${kind}/:id/${kind === 'works' ? 'files' : 'removal'}`, c => previewRemoval(c, kind, [c.req.param('id')]));
     app.delete(`/api/catalog/${kind}/:id`, async c => {
-        if (!isLocalRequest(c)) {
-            return c.json({ error: '删除功能仅支持本机同源请求' }, 403);
-        }
+        if (!isLocalRequest(c)) return c.json({ error: '删除功能仅支持本机同源请求' }, 403);
         if (!/^application\/json(?:\s*;|$)/i.test(c.req.header('Content-Type') ?? '')) return c.json({ error: '需要 JSON 请求' }, 415);
         const body = await c.req.json().catch(() => null);
-        if (body?.mode !== 'permanent' || typeof body.token !== 'string' || !/^[a-f0-9]{64}$/.test(body.token)) {
-            return c.json({ error: '请刷新页面，查看文件清单并确认永久删除' }, 400);
-        }
-        if (scan || removing) return c.json({ error: '索引正在更新，请稍后再试' }, 409);
-        removing = true;
-        let attempted = false;
-        let affectedWorks: string[] = [];
-        let affectedAssets: string[] = [];
-        let mediaRoot = downloadRoot;
-        let deleted;
-        let failure;
-        let removedLinks = 0;
-        let linkChange: { before: ReturnType<typeof readConfigLinks>; saved: ReturnType<typeof saveConfigLinks> } | undefined;
-        try {
-            const id = c.req.param('id');
-            const snapshot = await loadDatabaseCatalog();
-            const { local, plan, links, remainingLinks, removedLinks: count } = await planRemoval(snapshot, kind, id);
-            if (!plan) return c.json({ error: '没有找到可检查的本地副本' }, 404);
-            if (plan.view.token !== body.token) return c.json({ error: '文件或作品记录已变更，请重新查看删除范围' }, 409);
-            affectedWorks = local.works.flatMap(work => work.platformId ? [work.platformId] : []);
-            affectedAssets = [...local.assets.keys()];
-            mediaRoot = local.root;
-            // Save first so an unwritable configuration cannot leave media already deleted.
-            if (links && count) {
-                const saved = saveConfigLinks(configFile, remainingLinks!, links.revision);
-                linkChange = { before: links, saved };
-                removedLinks = count;
-            }
-            attempted = true;
-            deleted = await deletePermanently(local.root, kind, id, plan.units);
-        } catch (error) {
-            failure = error instanceof Error ? (error as NodeJS.ErrnoException).code ?? error.message : '操作失败';
-        } finally {
-            if (linkChange && !deleted) {
-                try { saveConfigLinks(configFile, linkChange.before.links, linkChange.saved.revision); }
-                catch { failure = `${failure ?? '删除未完成'}；配置链接恢复失败，请重新读取链接配置`; }
-            }
-            if (attempted) {
-                try { await reconcileDeletedWorks(databaseFile, mediaRoot, affectedWorks); }
-                catch (error) { failure ??= error instanceof Error ? error.message : '数据库更新失败'; }
-                databaseView = undefined;
-                catalog = undefined;
-                scanError = undefined;
-                for (const asset of affectedAssets) mediaPaths.delete(asset);
-            }
-            removing = false;
-        }
-        return failure ? c.json({ error: failure }, 409) : c.json({ ...deleted, removedLinks, ...await currentStatus() });
+        if (!isRemovalToken(body)) return c.json({ error: '请刷新页面，查看文件清单并确认永久删除' }, 400);
+        return commitRemoval(c, kind, [c.req.param('id')], body.token);
     });
 }
 

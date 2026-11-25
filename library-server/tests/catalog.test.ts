@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, stat, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rename, stat, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -192,6 +192,44 @@ test('database catalog, media routes, refresh, and confirmed deletion', async t 
         })).status, 403);
     });
 
+    await t.test('author link removal changes only matching config entries', async () => {
+        const matches = ['https://www.douyin.com/user/sec-author/?from=share',
+            '作者分享 https://douyin.com/user/sec%2Dauthor 复制打开'];
+        const otherLinks = ['https://www.douyin.com/user/sec-author-other', 'https://v.douyin.com/unknown/',
+            'https://www.douyin.com/video/7411111111111111111'];
+        const config = { link: [matches[0], ...otherLinks, matches[1]], path: './Downloaded', cookies: { sessionid: 'fixture-only' } };
+        await writeFile(configFile, JSON.stringify(config));
+        const authors = await (await app.request('http://localhost/api/catalog/authors')).json() as { items: { id: string }[] };
+        const authorUrl = 'http://localhost/api/catalog/authors/' + authors.items[0]!.id;
+        const endpoint = authorUrl + '/links';
+        assert.equal((await app.request(endpoint, { headers: { Origin: 'https://example.com' } })).status, 403);
+
+        const remove = (revision: string, origin = 'http://localhost') => app.request(endpoint, {
+            method: 'DELETE', headers: { 'Content-Type': 'application/json', Origin: origin }, body: JSON.stringify({ revision }),
+        });
+        const preview = await (await app.request(endpoint)).json() as { links: string[]; revision: string };
+        assert.deepEqual(preview.links, matches);
+        assert.equal((await remove(preview.revision, 'https://example.com')).status, 403);
+        assert.equal((await remove('invalid')).status, 400);
+
+        const concurrentLink = 'https://www.douyin.com/user/unrelated';
+        const modified = JSON.stringify({ ...config, link: [...config.link, concurrentLink] });
+        await writeFile(configFile, modified);
+        assert.equal((await remove(preview.revision)).status, 409);
+        assert.equal(await readFile(configFile, 'utf8'), modified);
+
+        const fresh = await (await app.request(endpoint)).json() as { revision: string };
+        const response = await remove(fresh.revision);
+        assert.equal(response.status, 200);
+        assert.deepEqual(await response.json(), { removedLinks: 2 });
+        assert.deepEqual(JSON.parse(await readFile(configFile, 'utf8')), { ...config, link: [...otherLinks, concurrentLink] });
+        assert.deepEqual((await (await app.request(endpoint)).json() as { links: string[] }).links, []);
+        assert.equal((await app.request(authorUrl)).status, 200);
+        assert.equal((await ready()).works, 2);
+        assert.equal(await readFile(video, 'utf8'), '0123456789');
+        assert.equal(await readFile(album, 'utf8'), 'first');
+    });
+
     await t.test('serves database works and ranged media through normal routes', async () => {
         const response = await app.request('http://localhost/api/catalog/works');
         assert.equal(response.status, 200);
@@ -340,5 +378,88 @@ test('database catalog, media routes, refresh, and confirmed deletion', async t 
         check.close();
         assert.equal((await app.request(endpoint)).status, 404);
         await assert.rejects(stat(path.join(root, '.catalog-removed-authors.json')));
+    });
+
+    await t.test('batch removal checks the complete selected scope before removing authors', async () => {
+        const firstDir = path.join(root, '批量甲', 'post', 'first');
+        const secondDir = path.join(root, '批量乙', 'post', 'second');
+        const firstFile = path.join(firstDir, 'first.mp4');
+        const secondFile = path.join(secondDir, 'second.mp4');
+        const otherFile = path.join(root, '其他作者', 'post', 'other-work', 'other-work.mp4');
+        await mkdir(firstDir, { recursive: true });
+        await mkdir(secondDir, { recursive: true });
+        await writeFile(firstFile, 'first');
+        await writeFile(secondFile, 'second');
+        const database = new DatabaseSync(databaseFile);
+        try {
+            const insert = database.prepare(`INSERT INTO aweme
+                (aweme_id,aweme_type,title,author_id,author_name,author_sec_uid,create_time,file_path)
+                VALUES (?,?,?,?,?,?,?,?)`);
+            insert.run('7455555555555555555', 'video', '甲作品', 'first', '批量甲', 'sec-first', 1793520000, firstFile);
+            insert.run('7466666666666666666', 'video', '乙作品', 'second', '批量乙', 'sec-second', 1793520000, secondFile);
+        } finally { database.close(); }
+        const firstLink = 'https://www.douyin.com/user/sec-first';
+        const secondLink = 'https://www.douyin.com/user/sec-second/?from=batch';
+        const otherLink = 'https://www.douyin.com/user/sec-other';
+        const config = { link: [otherLink, firstLink, secondLink], path: './Downloaded', avatar: true };
+        await writeFile(configFile, JSON.stringify(config));
+
+        const authors = await (await app.request('http://localhost/api/catalog/authors')).json() as {
+            items: { id: string; name: string }[];
+        };
+        const ids = authors.items.filter(author => author.name.startsWith('批量')).map(author => author.id);
+        const endpoint = 'http://localhost/api/catalog/authors/batch-removal';
+        const request = (method: string, selected: string[], token?: string, origin = 'http://localhost') => app.request(endpoint, {
+            method, headers: { 'Content-Type': 'application/json', Origin: origin },
+            body: JSON.stringify({ ids: selected, mode: 'permanent', token }),
+        });
+        assert.equal(ids.length, 2);
+        assert.equal((await request('POST', [], undefined)).status, 400);
+        assert.equal((await request('POST', [...ids, 'a'.repeat(24)])).status, 404);
+        assert.equal((await request('POST', ids, undefined, 'https://example.com')).status, 403);
+
+        const preview = async () => {
+            const response = await request('POST', ids);
+            assert.equal(response.status, 200);
+            return await response.json() as { token?: string; authors: { id: string }[]; workCount: number; fileCount: number; removedLinks: number; errors: string[] };
+        };
+        const plan = await preview();
+        assert.deepEqual(plan.authors.map(author => author.id).sort(), [...ids].sort());
+        assert.equal(plan.workCount, 2);
+        assert.equal(plan.removedLinks, 2);
+        assert.ok(plan.token);
+        assert.equal((await request('DELETE', ids.slice(0, 1), plan.token)).status, 409);
+
+        const sharedFile = path.join(firstDir, 'unselected.mp4');
+        await writeFile(sharedFile, 'shared');
+        const updatePath = (author: string, file: string) => {
+            const connection = new DatabaseSync(databaseFile);
+            try { connection.prepare('UPDATE aweme SET file_path=? WHERE author_sec_uid=?').run(file, author); }
+            finally { connection.close(); }
+        };
+        updatePath('sec-other', sharedFile);
+        const blocked = await preview();
+        assert.equal(blocked.token, undefined);
+        assert.ok(blocked.errors.some(error => error.includes('未选作品使用此路径')));
+        assert.equal((await request('DELETE', ids, plan.token)).status, 409);
+        assert.equal(await readFile(sharedFile, 'utf8'), 'shared');
+        updatePath('sec-other', otherFile);
+        await rm(sharedFile);
+
+        const nestedDir = path.join(firstDir, 'second');
+        const nestedFile = path.join(nestedDir, 'second.mp4');
+        await rename(secondDir, nestedDir);
+        updatePath('sec-second', nestedFile);
+        const fresh = await preview();
+        assert.ok(fresh.token);
+        assert.equal(fresh.fileCount, 2);
+        const result = await request('DELETE', [...ids].reverse(), fresh.token);
+        assert.equal(result.status, 200, await result.clone().text());
+        assert.equal((await result.json() as { removedLinks: number }).removedLinks, 2);
+        await assert.rejects(stat(firstFile));
+        await assert.rejects(stat(nestedFile));
+        assert.equal(await readFile(otherFile, 'utf8'), 'keep-other-author');
+        assert.deepEqual(JSON.parse(await readFile(configFile, 'utf8')), { ...config, link: [otherLink] });
+        assert.equal((await ready()).works, 1);
     });
 });

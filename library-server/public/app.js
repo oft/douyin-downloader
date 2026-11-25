@@ -28,6 +28,7 @@ let scanStatusVersion = 0;
 let toastTimer;
 let issueById = new Map();
 let deleting = false;
+const selectedAuthors = new Set();
 let linkConfig;
 let linkAuthors = {};
 let linkDraft = [];
@@ -99,6 +100,12 @@ function renderToolbar() {
         filters = select('status', '状态', issueViews, 'pending') + select('code', '类型', { '': '全部类型', ...issueNames });
     } else if (view === 'works' || authorId) {
         filters = select('kind', '类型', { '': '全部类型', ...kindNames }) + select('source', '来源', { '': '全部来源', ...sourceNames });
+    } else if (view === 'authors') {
+        const list = params.get('layout') === 'list';
+        filters = `<div class="author-layout" role="group" aria-label="作者展示方式">
+            <button class="secondary" type="button" data-author-layout="cards" aria-pressed="${!list}">卡片</button>
+            <button class="secondary" type="button" data-author-layout="list" aria-pressed="${list}">列表</button>
+        </div><label class="author-select-page"><input id="select-author-page" type="checkbox" disabled>全选本页</label>`;
     }
     toolbar.innerHTML = `<label class="search"><span aria-hidden="true">⌕</span><input id="search" type="search" maxlength="200" value="${escape(params.get('q') ?? '')}" placeholder="${placeholder}" aria-label="${placeholder}"></label><div class="filters">${filters}</div>`;
     byId('search').addEventListener('input', event => {
@@ -109,6 +116,24 @@ function renderToolbar() {
     for (const control of toolbar.querySelectorAll('[data-filter]')) {
         control.addEventListener('change', () => setParams({ [control.dataset.filter]: control.value, q: byId('search').value, page: null }));
     }
+}
+
+function updateAuthorSelection() {
+    const selectPage = byId('select-author-page');
+    const remove = byId('batch-delete-authors');
+    if (!selectPage || !remove) return;
+    const boxes = [...results.querySelectorAll('input[data-select-author]')];
+    let checked = 0;
+    for (const box of boxes) {
+        box.checked = selectedAuthors.has(box.value);
+        if (box.checked) checked++;
+    }
+    selectPage.disabled = !boxes.length;
+    selectPage.checked = boxes.length > 0 && checked === boxes.length;
+    selectPage.indeterminate = checked > 0 && checked < boxes.length;
+    byId('clear-author-selection').hidden = !selectedAuthors.size;
+    remove.disabled = !selectedAuthors.size;
+    remove.textContent = selectedAuthors.size ? `批量删除（${number.format(selectedAuthors.size)}）` : '批量删除';
 }
 
 function box(title, description, extra = '') {
@@ -133,11 +158,15 @@ function workCard(work) {
     </article>`;
 }
 
-function authorCard(author) {
+function authorCard(author, list) {
     const avatar = author.avatar ? `<img src="${asset(author.avatar)}" alt="" loading="lazy" decoding="async">` : '';
     const initial = Array.from(author.name)[0] ?? '◎';
-    return `<a class="author-card" href="${authorLink(author.id)}"><span class="avatar"><span aria-hidden="true">${escape(initial)}</span>${avatar}</span><span class="author-card-info">
-        <strong>${escape(author.name)}</strong><span>${number.format(author.workCount)} 件作品</span>${author.aliases.length ? `<small>曾用名 ${escape(author.aliases.join('、'))}</small>` : ''}</span><span class="author-arrow" aria-hidden="true">›</span></a>`;
+    const count = `<span class="author-count">${number.format(author.workCount)} 件作品</span>`;
+    return `<article class="author-entry"><label class="author-check"><input type="checkbox" data-select-author
+        value="${escape(author.id)}" aria-label="选择 ${escape(author.name)}"></label>
+        <a class="author-card" href="${authorLink(author.id)}"><span class="avatar"><span aria-hidden="true">${escape(initial)}</span>${avatar}</span><span class="author-card-info">
+        <strong>${escape(author.name)}</strong>${list ? '' : count}${author.aliases.length ? `<small>曾用名 ${escape(author.aliases.join('、'))}</small>` : ''}</span>
+        ${list ? count : ''}<span class="author-arrow" aria-hidden="true">›</span></a></article>`;
 }
 
 function issueCard(row) {
@@ -172,6 +201,7 @@ async function loadList({ showLoading = false } = {}) {
     if (showLoading) {
         results.innerHTML = '<div class="empty"><span class="spinner" aria-hidden="true"></span><p>正在读取…</p></div>';
         pager.hidden = true;
+        if (endpoint === 'authors') updateAuthorSelection();
     }
     results.setAttribute('aria-busy', 'true');
     try {
@@ -180,7 +210,8 @@ async function loadList({ showLoading = false } = {}) {
         if (author) {
             byId('heading').textContent = author.name;
             const issueAction = author.issueCount ? `<a class="secondary" href="${issueLink('author', author.id)}">查看作者异常</a>` : '';
-            byId('header-action').innerHTML = `${issueAction}<button class="secondary danger" type="button" data-remove-author="${escape(author.id)}">删除作者</button>`;
+            byId('header-action').innerHTML = `${issueAction}<button class="secondary" type="button" data-remove-author-links="${escape(author.id)}">删除链接</button>
+                <button class="secondary danger" type="button" data-remove-author="${escape(author.id)}">删除作者</button>`;
         }
         let summary = `共 ${number.format(data.total)} ${endpoint === 'authors' ? '位作者' : endpoint === 'issues' ? '条异常记录' : '件作品'}`;
         if (author?.aliases.length) summary += `　·　曾用名 ${author.aliases.join('、')}`;
@@ -195,15 +226,20 @@ async function loadList({ showLoading = false } = {}) {
             const description = view === 'issues' && !params.has('q') && !params.has('code') && (!params.has('status') || params.get('status') === 'pending')
                 ? '当前范围内没有待处理的异常。' : '试试其他搜索词或筛选条件。';
             results.innerHTML = box('没有符合条件的记录', description);
+        } else if (endpoint === 'authors') {
+            const list = params.get('layout') === 'list';
+            results.innerHTML = `<div class="${list ? 'author-list' : 'author-grid'}">${data.items.map(item => authorCard(item, list)).join('')}</div>`;
         } else {
-            const [className, render] = endpoint === 'works' ? ['work-grid', workCard] : endpoint === 'authors' ? ['author-grid', authorCard] : ['issue-list', issueCard];
+            const [className, render] = endpoint === 'works' ? ['work-grid', workCard] : ['issue-list', issueCard];
             results.innerHTML = `<div class="${className}">${data.items.map(render).join('')}</div>`;
         }
+        if (endpoint === 'authors') updateAuthorSelection();
         renderPager(data);
     } catch (error) {
         if (version !== listVersion) return;
         results.innerHTML = box('读取失败', error.message, '<button type="button" class="secondary" data-retry>重试</button>');
         pager.hidden = true;
+        if (endpoint === 'authors') updateAuthorSelection();
     } finally {
         if (version === listVersion) results.setAttribute('aria-busy', 'false');
     }
@@ -377,6 +413,9 @@ function navigate() {
         void loadLinks();
     } else {
         renderToolbar();
+        if (view === 'authors' && !authorId) {
+            byId('header-action').innerHTML = '<button id="clear-author-selection" class="plain" type="button" hidden>清空选择</button><button id="batch-delete-authors" class="secondary danger" type="button" disabled>批量删除</button>';
+        }
         if (view === 'issues' && !status.scannedAt) {
             results.setAttribute('aria-busy', 'true');
             results.innerHTML = '<div class="empty"><span class="spinner" aria-hidden="true"></span><p>正在扫描本地媒体…</p></div>';
@@ -484,6 +523,11 @@ async function showWork(id) {
             const failed = () => { message.hidden = false; };
             video.addEventListener('error', failed);
             if (video.error) failed();
+            void video.play().catch(error => {
+                if (error.name !== 'NotAllowedError' || version !== modalVersion || !modal.open) return;
+                video.muted = true;
+                return video.play().catch(() => {});
+            });
         }
         if (byId('album-image')) {
             let index = 0;
@@ -529,25 +573,83 @@ function fileList(copy, index) {
         <div class="file-copy-body"><div class="file-path"><code class="path">${escape(copy.directory || '下载根目录')}</code><button class="plain" type="button" data-copy="${escape(copy.directory)}">复制目录</button></div>${entries}</div></details>`;
 }
 
-async function showRemoval(kind, id, showFiles = false) {
+async function showAuthorLinkRemoval(id) {
+    const version = openModal('删除链接', 'review-modal');
+    const body = byId('modal-body');
+    const endpoint = `authors/${encodeURIComponent(id)}/links`;
+    body.innerHTML = '<div class="empty"><span class="spinner" aria-hidden="true"></span><p>正在读取作者链接…</p></div>';
+    try {
+        const plan = await api(endpoint);
+        if (version !== modalVersion || !modal.open) return;
+        byId('modal-subtitle').textContent = plan.name;
+        if (!plan.links.length) {
+            body.innerHTML = box('没有匹配的作者主页链接', '可以在链接管理中查看配置里的其他链接。',
+                '<a class="secondary" href="#links" data-modal-link>打开链接管理</a>');
+            return;
+        }
+        const listing = plan.links.map(link => `<li><code class="path">${escape(link)}</code></li>`).join('');
+        body.innerHTML = `<p class="removal-count">将从下载器配置移除以下 ${number.format(plan.links.length)} 条作者主页链接</p>
+            <ul class="removal-works author-link-preview">${listing}</ul>
+            <p id="author-link-error" class="player-error" role="alert" hidden></p>
+            <div class="form-actions"><button id="reload-author-links" class="secondary" type="button" hidden>重新读取链接</button>
+                <button class="secondary" type="button" data-dismiss>取消</button>
+                <button id="confirm-author-links" class="primary danger" type="button">确认删除链接</button></div>`;
+        const confirm = byId('confirm-author-links');
+        const retry = byId('reload-author-links');
+        const message = byId('author-link-error');
+        retry.addEventListener('click', () => void showAuthorLinkRemoval(id));
+        confirm.addEventListener('click', async () => {
+            if (deleting) return;
+            deleting = true;
+            const controls = [...modal.querySelectorAll('button:not(:disabled)')];
+            controls.forEach(control => { control.disabled = true; });
+            confirm.textContent = '正在删除…';
+            try {
+                const result = await api(endpoint, { method: 'DELETE', headers: jsonHeaders,
+                    body: JSON.stringify({ revision: plan.revision }) });
+                if (!linksChanged()) linkConfig = undefined;
+                if (version === modalVersion && modal.open) modal.close();
+                showToast(`已删除 ${number.format(result.removedLinks)} 条作者主页链接`);
+            } catch (error) {
+                if (version === modalVersion && modal.open) {
+                    message.textContent = error.message;
+                    message.hidden = false;
+                    retry.hidden = false;
+                } else showToast(error.message, true);
+            } finally {
+                deleting = false;
+                controls.forEach(control => { control.disabled = false; });
+                confirm.textContent = '确认删除链接';
+            }
+        });
+    } catch (error) {
+        if (version === modalVersion && modal.open) body.innerHTML = box('无法读取作者链接', error.message);
+    }
+}
+
+async function showRemoval(kind, id, showFiles = false, batchIds = []) {
     const isAuthor = kind === 'authors';
-    const title = isAuthor ? '删除作者' : showFiles ? '作品文件清单' : '删除作品';
+    const batch = batchIds.length > 0;
+    const title = batch ? '批量删除作者' : isAuthor ? '删除作者' : showFiles ? '作品文件清单' : '删除作品';
+    const endpoint = batch ? 'authors/batch-removal' : `${kind}/${encodeURIComponent(id)}`;
     const version = openModal(title, 'remove-modal');
     const body = byId('modal-body');
     body.innerHTML = '<div class="empty"><span class="spinner" aria-hidden="true"></span><p>正在读取文件…</p></div>';
     try {
-        const plan = await api(`${kind}/${encodeURIComponent(id)}/${isAuthor ? 'removal' : 'files'}`);
+        const plan = batch ? await api(endpoint, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ ids: batchIds }) })
+            : await api(`${endpoint}/${isAuthor ? 'removal' : 'files'}`);
         if (version !== modalVersion || !modal.open) return;
-        byId('modal-subtitle').textContent = plan.title;
+        byId('modal-subtitle').textContent = batch ? `已选 ${number.format(plan.authors.length)} 位作者` : plan.title;
         const summary = `${number.format(plan.workCount)} 件作品 · ${number.format(plan.copyCount)} 个副本 · ${number.format(plan.fileCount)} 个文件 · ${formatSize(plan.size)}`;
         const authorWorks = plan.works?.map(work => `<li><span>${escape(work.title)}</span><small>${number.format(work.copyCount)} 个副本</small></li>`).join('');
-        const listing = isAuthor && authorWorks ? `<details class="file-copy" open><summary><strong>受影响的作品</strong></summary><ul class="removal-works">${authorWorks}</ul>${plan.workCount > plan.works.length ? `<p class="summary more-works">此处显示前 ${plan.works.length} 件，全部 ${number.format(plan.workCount)} 件都在删除范围内。</p>` : ''}</details>`
+        const authors = batch ? `<details class="file-copy" open><summary><strong>所选作者</strong></summary><ul class="removal-works">${plan.authors.map(author => `<li><span>${escape(author.name)}</span><small>${number.format(author.workCount)} 件作品</small></li>`).join('')}</ul></details>` : '';
+        const listing = isAuthor && authorWorks ? `<details class="file-copy" ${batch ? '' : 'open'}><summary><strong>受影响的作品</strong></summary><ul class="removal-works">${authorWorks}</ul>${plan.workCount > plan.works.length ? `<p class="summary more-works">此处显示前 ${plan.works.length} 件，全部 ${number.format(plan.workCount)} 件都在删除范围内。</p>` : ''}</details>`
             : (plan.copies ?? []).map(fileList).join('');
-        const scope = isAuthor ? `此作者的全部本地作品副本和对应数据库记录将永久删除，同时移除配置中匹配的 ${number.format(plan.removedLinks ?? 0)} 条作者主页链接。删除后无法从资料库恢复。`
+        const scope = isAuthor ? `${batch ? '所选作者' : '此作者'}的全部本地作品副本和对应数据库记录将永久删除，同时移除配置中匹配的 ${number.format(plan.removedLinks ?? 0)} 条作者主页链接。删除后无法从资料库恢复。`
             : '此作品的全部本地副本将永久删除。平铺文件按清单删除。删除后无法从资料库恢复。';
         const errors = plan.errors.length ? `<div class="player-error" role="alert">清单无法完整读取，请检查目录后刷新数据库。<ul>${plan.errors.slice(0, 5).map(error => `<li>${escape(error)}</li>`).join('')}</ul></div>` : '';
         const back = isAuthor ? '<button class="secondary" type="button" data-dismiss>取消</button>' : `<button class="secondary" type="button" data-work-back="${escape(id)}">返回作品</button>`;
-        body.innerHTML = `<p class="removal-count">${summary}</p>${listing}<p class="summary removal-scope">${scope}</p>${errors}
+        body.innerHTML = `<p class="removal-count">${summary}</p>${authors}${listing}<p class="summary removal-scope">${scope}</p>${errors}
             <p id="removal-error" class="player-error" role="alert" hidden></p><div class="form-actions">${back}<button id="confirm-removal" class="primary danger" type="button" ${plan.token ? '' : 'disabled'}>永久删除</button></div>`;
         byId('confirm-removal').addEventListener('click', async () => {
             if (deleting) return;
@@ -556,8 +658,11 @@ async function showRemoval(kind, id, showFiles = false) {
             controls.forEach(control => { control.disabled = true; });
             byId('confirm-removal').textContent = '正在删除…';
             try {
-                const result = await api(`${kind}/${encodeURIComponent(id)}`, { method: 'DELETE', headers: jsonHeaders, body: JSON.stringify({ mode: 'permanent', token: plan.token }) });
+                const result = await api(endpoint, { method: 'DELETE', headers: jsonHeaders,
+                    body: JSON.stringify({ mode: 'permanent', token: plan.token, ids: batch ? batchIds : undefined }) });
                 if (isAuthor && !linksChanged()) linkConfig = undefined;
+                if (isAuthor) for (const selected of batch ? batchIds : [id]) selectedAuthors.delete(selected);
+                updateAuthorSelection();
                 const showReceipt = version === modalVersion && modal.open;
                 ++scanStatusVersion;
                 clearTimeout(scanTimer);
@@ -569,7 +674,7 @@ async function showRemoval(kind, id, showFiles = false) {
                 } else if (route.view === 'issues' && !status.scannedAt) void refreshStatus({ rescan: true });
                 else void loadList();
                 if (showReceipt) {
-                    openModal(isAuthor ? '已删除作者' : '已删除作品', 'review-modal');
+                    openModal(batch ? `已删除 ${number.format(batchIds.length)} 位作者` : isAuthor ? '已删除作者' : '已删除作品', 'review-modal');
                     const scanWarning = result.databaseError ? '<p class="player-error">无法读取更新后的数据库，请刷新页面。</p>' : '';
                     body.innerHTML = `<p class="summary">已永久删除 ${number.format(result.deletedFiles)} 个文件和 ${number.format(result.deletedDirectories)} 个目录。${isAuthor ? `已移除 ${number.format(result.removedLinks ?? 0)} 条作者主页链接。` : ''}</p>${scanWarning}<div class="form-actions"><button class="secondary" type="button" data-dismiss>完成</button></div>`;
                 } else showToast('永久删除已完成');
@@ -583,7 +688,7 @@ async function showRemoval(kind, id, showFiles = false) {
                     retry.type = 'button';
                     retry.className = 'secondary';
                     retry.textContent = '重新读取清单';
-                    retry.addEventListener('click', () => void showRemoval(kind, id, showFiles));
+                    retry.addEventListener('click', () => void showRemoval(kind, id, showFiles, batchIds));
                     message.after(retry);
                     controls.splice(controls.indexOf(byId('confirm-removal')), 1);
                 } else showToast(error.message, true);
@@ -630,6 +735,25 @@ function editReview(id) {
 
 function goToPage(page) { setParams({ page, q: byId('search').value }); }
 
+toolbar.addEventListener('click', event => {
+    const layout = event.target.closest('[data-author-layout]');
+    if (layout) setParams({ layout: layout.dataset.authorLayout === 'list' ? 'list' : null, q: byId('search').value });
+});
+toolbar.addEventListener('change', event => {
+    if (event.target.id !== 'select-author-page') return;
+    for (const box of results.querySelectorAll('input[data-select-author]')) {
+        if (event.target.checked) selectedAuthors.add(box.value);
+        else selectedAuthors.delete(box.value);
+    }
+    updateAuthorSelection();
+});
+results.addEventListener('change', event => {
+    const box = event.target.closest('input[data-select-author]');
+    if (!box) return;
+    if (box.checked) selectedAuthors.add(box.value);
+    else selectedAuthors.delete(box.value);
+    updateAuthorSelection();
+});
 results.addEventListener('click', event => {
     const item = event.target.closest('button');
     if (!item) return;
@@ -657,6 +781,15 @@ byId('scan-button').addEventListener('click', () => void refreshStatus({ rescan:
 byId('header-action').addEventListener('click', event => {
     const author = event.target.closest('button[data-remove-author]');
     if (author) void showRemoval('authors', author.dataset.removeAuthor);
+    const link = event.target.closest('button[data-remove-author-links]');
+    if (link) void showAuthorLinkRemoval(link.dataset.removeAuthorLinks);
+    if (event.target.closest('#clear-author-selection')) {
+        selectedAuthors.clear();
+        updateAuthorSelection();
+    }
+    if (event.target.closest('#batch-delete-authors') && selectedAuthors.size) {
+        void showRemoval('authors', undefined, false, [...selectedAuthors]);
+    }
 });
 byId('modal-close').addEventListener('click', () => modal.close());
 modal.addEventListener('cancel', event => { if (deleting) event.preventDefault(); });

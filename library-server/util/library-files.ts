@@ -21,6 +21,7 @@ interface Unit {
     kind: 'file' | 'directory';
     stamp: string;
     identity: string;
+    size?: number;
     entries?: Entry[];
 }
 
@@ -79,7 +80,7 @@ async function copyInventory(root: string, copy: WorkCopy) {
             for (const name of copy.flatFiles) {
                 const relative = copy.directory ? `${copy.directory}/${name}` : name;
                 const details = await inspectPath(fromRoot(root, relative), 'file');
-                units.push({ relative, kind: 'file', stamp: stamp(details), identity: identity(details) });
+                units.push({ relative, kind: 'file', size: details.size, stamp: stamp(details), identity: identity(details) });
                 files.push({ name, kind: 'file', size: details.size, stamp: stamp(details), identity: identity(details) });
             }
         } else {
@@ -96,28 +97,50 @@ async function copyInventory(root: string, copy: WorkCopy) {
     }
 }
 
-export async function removalPlan(catalog: Catalog, kind: RemovalKind, id: string) {
-    const work = kind === 'works' ? catalog.workById.get(id) : undefined;
-    const author = kind === 'authors' ? catalog.authorById.get(id) : undefined;
-    if (!work && !author) return undefined;
-    const works = work ? [work] : catalog.works.filter(item => item.authorId === id);
+const pathKey = (relative: string) => process.platform === 'win32' ? relative.toLowerCase() : relative;
+
+function parentUnit(units: Map<string, Unit>, relative: string) {
+    for (let parent = path.posix.dirname(relative); parent !== '.' && parent !== '/'; parent = path.posix.dirname(parent)) {
+        const unit = units.get(pathKey(parent));
+        if (unit?.kind === 'directory') return unit;
+    }
+    return undefined;
+}
+
+export async function removalPlan(catalog: Catalog, kind: RemovalKind, ids: string[], protectedPaths: string[] = []) {
+    const work = kind === 'works' ? catalog.workById.get(ids[0]!) : undefined;
+    const authors = kind === 'authors' ? ids.flatMap(id => {
+        const author = catalog.authorById.get(id);
+        return author ? [author] : [];
+    }) : [];
+    if (!work && (!authors.length || authors.length !== ids.length)) return undefined;
+    const selected = new Set(ids);
+    const works = work ? [work] : catalog.works.filter(item => item.authorId && selected.has(item.authorId));
     const copies = await parallelMap(works.flatMap(item => item.copies), copy => copyInventory(catalog.root, copy));
-    const units = [...new Map(copies.flatMap(copy => copy.units).map(unit => [unit.relative, unit])).values()];
-    const entries = copies.flatMap(copy => copy.files).filter(file => file.kind !== 'directory');
+    const targets = new Map(copies.flatMap(copy => copy.units).map(unit => [pathKey(unit.relative), unit]));
+    const units = [...targets.values()].filter(unit => !parentUnit(targets, unit.relative));
+    const entries = units.flatMap<Entry | Unit>(unit => unit.kind === 'file' ? [unit]
+        : (unit.entries ?? []).filter(file => file.kind !== 'directory'));
     const errors = copies.filter(copy => copy.error).map(copy => `${copy.directory || '.'}：${copy.error}`);
-    if (author && catalog.issues.some(issue => issue.authorId === author.id && issue.code === 'unreadable_folder')) {
-        errors.push('此作者存在无法扫描的目录，请先检查目录并重新扫描。');
+    if (authors.length && catalog.issues.some(issue => issue.authorId && selected.has(issue.authorId) && issue.code === 'unreadable_folder')) {
+        errors.push('所选作者存在无法扫描的目录，请先检查目录并重新扫描。');
+    }
+    if (targets.size) {
+        for (const relative of new Set(protectedPaths)) {
+            if (targets.has(pathKey(relative)) || parentUnit(targets, relative)) errors.push(`未选作品使用此路径：${relative}`);
+        }
     }
     const token = errors.length ? undefined : createHash('sha256').update(JSON.stringify({
-        scannedAt: catalog.scannedAt, kind, id, units,
+        scannedAt: catalog.scannedAt, kind, ids, units,
     })).digest('hex');
     return {
         units,
         view: {
-            title: work?.title ?? author?.name, token, errors, workCount: works.length, copyCount: copies.length,
+            title: work?.title ?? (authors.length === 1 ? authors[0]!.name : undefined), token, errors, workCount: works.length, copyCount: copies.length,
             fileCount: entries.length, size: entries.reduce((sum, file) => sum + (file.size ?? 0), 0),
             copies: work ? copies.map(({ units, files, ...copy }) => ({ ...copy, files: files.map(({ stamp, identity, ...file }) => file) })) : undefined,
-            works: author ? works.slice(0, 50).map(item => ({ id: item.id, title: item.title, copyCount: item.copies.length })) : undefined,
+            works: authors.length ? works.slice(0, 50).map(item => ({ id: item.id, title: item.title, copyCount: item.copies.length })) : undefined,
+            authors: authors.map(({ id, name, workCount }) => ({ id, name, workCount })),
         },
     };
 }
@@ -135,7 +158,7 @@ async function deleteEntry(absolute: string, expected: Pick<Entry, 'kind' | 'ide
     }
 }
 
-export async function deletePermanently(root: string, kind: RemovalKind, id: string, units: Unit[]) {
+export async function deletePermanently(root: string, units: Unit[]) {
     await assertDirectory(root);
     let deletedFiles = 0;
     let deletedDirectories = 0;
