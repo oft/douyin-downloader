@@ -10,7 +10,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import aiohttp
@@ -435,6 +435,8 @@ class DouyinAPIClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._browser_post_aweme_items: Dict[str, Dict[str, Any]] = {}
         self._browser_post_stats: Dict[str, Any] = {}
+        self._browser_post_profile_uid = None
+        self._browser_post_profile_ids: Set[str] = set()
         selected_ua = (browser_session.user_agent if browser_session is not None else None) or random.choice(_USER_AGENT_POOL)
         if browser_session is not None:
             browser_session.user_agent = selected_ua
@@ -1987,6 +1989,8 @@ class DouyinAPIClient:
     ) -> List[str]:
         browser_started = time.monotonic()
         target_url = f"{self.BASE_URL}/user/{sec_uid}"
+        # The live homepage also fetches posts from Douyin's www-hj API host.
+        profile_hosts = {urlsplit(target_url).hostname, "www-hj.douyin.com"}
         timeout_ms = max(30, int(wait_timeout_seconds)) * 1000
         ids: List[str] = []
         seen: set[str] = set()
@@ -2004,14 +2008,28 @@ class DouyinAPIClient:
         deadline = browser_started + max(30, int(wait_timeout_seconds))
         self._browser_post_aweme_items = {}
         self._browser_post_stats = {}
+        self._browser_post_profile_uid = str(sec_uid)
+        self._browser_post_profile_ids = set()
 
-        def _merge(new_ids: List[str]):
+        def _merge(new_ids: List[str], *, from_profile=False):
             for aweme_id in new_ids:
+                if aweme_id and from_profile:
+                    self._browser_post_profile_ids.add(str(aweme_id))
                 if aweme_id and aweme_id not in seen:
                     seen.add(aweme_id)
                     ids.append(aweme_id)
 
+        async def merge_profile_cards():
+            # Membership in the target profile's scoped post cards is evidence
+            # even when a coauthored item's primary creator is another account.
+            page_url = urlsplit(str(getattr(page, "url", "")))
+            target = urlsplit(target_url)
+            if page_url.hostname == target.hostname and page_url.path == target.path:
+                _merge(await self._extract_aweme_ids_from_page(page), from_profile=True)
+
         def finish(reason=None, force_empty=False):
+            if force_empty:
+                self._browser_post_profile_ids.clear()
             selected_ids = [] if force_empty else list(dict.fromkeys(post_api_ids + ids))
             final_reason = reason or stop_reason
             failure = post_failure_reason
@@ -2029,7 +2047,8 @@ class DouyinAPIClient:
                 "post_pages": post_api_page_hits, "has_more": post_api_has_more,
                 "stop_reason": final_reason, "failure_reason": failure,
                 "complete": not force_empty and not failure and
-                (final_reason == "number_limit" or post_api_has_more is False),
+                (final_reason == "number_limit" or
+                 (final_reason == "end_of_list" and post_api_has_more is False)),
             }
             logger.warning("浏览器作品采集结束：duration_ms=%s stats=%s",
                            _elapsed_ms(browser_started), self._browser_post_stats)
@@ -2120,7 +2139,8 @@ class DouyinAPIClient:
                             fresh_items.append(item)
                             if on_items is None:
                                 post_api_aweme_items[aweme_id_str] = item
-                    _merge(extracted)
+                    _merge(extracted, from_profile=(response_user == sec_uid
+                           and urlsplit(url).hostname in profile_hosts))
                     for aweme_id in extracted:
                         if aweme_id not in post_api_seen:
                             post_api_seen.add(aweme_id)
@@ -2205,7 +2225,7 @@ class DouyinAPIClient:
                             logger.warning("Browser page closed during warmup")
                             break
                         await self._check_browser_user_available(page)
-                        _merge(await self._extract_aweme_ids_from_page(page))
+                        await merge_profile_cards()
                         await drain_responses()
                         if ids or post_api_has_more is False or post_failure_terminal:
                             break
@@ -2242,7 +2262,7 @@ class DouyinAPIClient:
                             await drain_responses()
                             if not ids:
                                 await self._check_browser_user_available(page)
-                            _merge(await self._extract_aweme_ids_from_page(page))
+                            await merge_profile_cards()
                             if (len(ids) > before or post_api_has_more is False
                                     or stream_limit_reached or post_failure_terminal):
                                 break
@@ -2268,6 +2288,23 @@ class DouyinAPIClient:
                         if stable_rounds >= idle_stop_rounds:
                             stop_reason = "idle"
                             break
+                    if stop_reason == "end_of_list":
+                        # The regular feed can finish before the page inserts
+                        # coauthored cards (and updates its displayed count).
+                        # Let that delayed render settle without another scroll.
+                        for _ in range(10):
+                            if page.is_closed():
+                                stop_reason = "page_closed"
+                                break
+                            await page.wait_for_timeout(400)
+                            await drain_responses()
+                            await merge_profile_cards()
+                            if stream_limit_reached:
+                                stop_reason = "number_limit"
+                                break
+                            if post_failure_terminal:
+                                stop_reason = "page_request_failed"
+                                break
                 except (UserUnavailableError, BrowserPageAccessError):
                     raise
                 except Exception as exc:
@@ -2335,6 +2372,11 @@ class DouyinAPIClient:
             raise UserUnavailableError(reason)
         if reason == "网页服务异常":
             raise BrowserPageAccessError("抖音网页显示“服务异常”，已停止本轮更新；请稍后手动检查网页状态。")
+
+    def browser_post_belongs_to_profile(self, aweme_id: str, sec_uid: str) -> bool:
+        """Whether this run observed the ID in the target feed or scoped post cards."""
+        return (str(sec_uid) == self._browser_post_profile_uid
+                and str(aweme_id) in self._browser_post_profile_ids)
 
     def pop_browser_post_aweme_items(self) -> Dict[str, Dict[str, Any]]:
         items = self._browser_post_aweme_items

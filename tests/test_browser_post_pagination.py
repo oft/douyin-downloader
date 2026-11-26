@@ -35,7 +35,9 @@ class Page:
                     raise ValueError("fixture response body unavailable")
                 return data
             response = SimpleNamespace(
-                url="https://www.douyin.com/aweme/v1/web/aweme/post/?sec_user_id=test",
+                url="https://" + data.get("_response_host", "www.douyin.com") + "/aweme/v1/web/aweme/post/" + (
+                    "" if data.get("_response_user", "test") is None else
+                    "?sec_user_id=" + data.get("_response_user", "test")),
                 status=data.get("_http_status", 200), json=response_json,
                 headers={"content-type": data.get("_content_type", "application/json")},
                 request=SimpleNamespace(method=data.get("_method", "GET")))
@@ -83,7 +85,8 @@ def collector(monkeypatch):
 async def test_response_growth_during_wait_does_not_count_as_idle(collector):
     client, page = collector([post_page(i, has_more=int(i < 11)) for i in range(12)])
     ids = await client.collect_user_post_ids_via_browser("test", idle_rounds=8)
-    assert len(ids) == 216 and page.waits == 11
+    assert len(ids) == 216
+    assert page.waited_ms == 11 * 1200 + 4000
     stats = client.pop_browser_post_stats()
     assert stats["complete"] is True and stats["stop_reason"] == "end_of_list"
     assert stats["post_pages"] == 12 and page.handlers == []
@@ -190,6 +193,39 @@ async def test_streaming_storage_errors_propagate_and_remove_response_listener(c
     assert page.handlers == []
 
 
+@pytest.mark.parametrize("response_user,host,proven", [
+    ("test", "www.douyin.com", True), ("test", "www-hj.douyin.com", True),
+    (None, "www.douyin.com", False), ("other", "www.douyin.com", False),
+    ("test", "example.com", False),
+])
+async def test_coauthored_membership_requires_target_feed_evidence(collector, response_user, host, proven):
+    data = {"status_code": 0, "has_more": 0, "_response_user": response_user,
+            "_response_host": host,
+            "aweme_list": [{"aweme_id": "shared", "author": {"sec_uid": "partner"}}]}
+    api, _page = collector([data])
+    async def deliver(_items):
+        assert api.browser_post_belongs_to_profile("shared", "test") is proven
+        return True
+    await api.collect_user_post_ids_via_browser("test", on_items=deliver, max_scrolls=1)
+    assert api.browser_post_belongs_to_profile("shared", "test") is proven
+    assert api.browser_post_belongs_to_profile("shared", "partner") is False
+    api.pop_browser_post_stats()
+    assert api.browser_post_belongs_to_profile("shared", "test") is proven
+
+
+async def test_profile_membership_does_not_survive_the_next_author(collector):
+    api, page = collector([{"status_code": 0, "has_more": 0,
+                            "aweme_list": [{"aweme_id": "shared"}]}])
+    await api.collect_user_post_ids_via_browser("test")
+    assert api.browser_post_belongs_to_profile("shared", "test") is True
+    page.pages = [{"status_code": 0, "has_more": 0, "_response_user": "next",
+                   "aweme_list": [{"aweme_id": "next-only"}]}]
+    await api.collect_user_post_ids_via_browser("next")
+    assert api.browser_post_belongs_to_profile("shared", "test") is False
+    assert api.browser_post_belongs_to_profile("shared", "next") is False
+    assert api.browser_post_belongs_to_profile("next-only", "next") is True
+
+
 async def test_slow_response_is_given_more_than_1_2_seconds_before_idle_stop(collector):
     client, page = collector([post_page(0)] + [None] * 6 + [post_page(1, has_more=0)])
     ids = await client.collect_user_post_ids_via_browser("test", max_scrolls=1, idle_rounds=1)
@@ -203,7 +239,7 @@ async def test_explicit_empty_last_page_is_not_a_browser_failure(collector):
     assert await client.collect_user_post_ids_via_browser("test") == []
     stats = client.pop_browser_post_stats()
     assert stats["complete"] is True and stats["failure_reason"] == ""
-    assert stats["stop_reason"] == "end_of_list" and page.waits == 0
+    assert stats["stop_reason"] == "end_of_list" and page.waited_ms == 4000
 
 
 @pytest.mark.parametrize("data,reason", [

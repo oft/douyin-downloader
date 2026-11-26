@@ -1,4 +1,6 @@
 import asyncio
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock
 
@@ -7,6 +9,7 @@ import pytest
 import core.user_modes.post_strategy as post_strategy_module
 from control.queue_manager import QueueManager
 from core.api_client import DouyinAPIClient, FailedPayload, UserUnavailableError
+from core.browser_session import BrowserSession
 from core.user_downloader import UserDownloader
 from storage.file_manager import FileManager
 from utils.browser_runtime import BrowserUnavailableError
@@ -662,6 +665,104 @@ async def test_foreign_page_items_are_not_retried_as_eight_missing_author_detail
     result = await downloader.download({"sec_uid": "sec_uid_x"})
     assert result.total == result.success == 1 and result.incomplete_reason is None
     detail.assert_not_awaited()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("include_pinned", [False, True])
+@pytest.mark.parametrize("shared_source", ["post_response", "profile_card", "delayed_profile_card"])
+@pytest.mark.parametrize("post_host", ["www.douyin.com", "www-hj.douyin.com"])
+async def test_browser_keeps_coauthored_post_and_only_excludes_the_pinned_post(
+        tmp_path, monkeypatch, streaming, include_pinned, shared_source, post_host):
+    session = BrowserSession()
+    session.post_api_requires_browser = True
+    api = DouyinAPIClient({}, browser_session=session)
+    downloader = _build_downloader(tmp_path, mode=["post"], api_client=api)
+    downloader.stream_downloads = streaming
+    downloader.config._data.update(download_pinned=include_pinned,
+                                   browser_fallback={"enabled": True})
+    works = [_make_aweme(str(7400000000000000000 + index)) for index in range(40)]
+    for work in works:
+        work["author"]["sec_uid"] = "target"
+    works[0]["is_top"] = 1
+    shared = works[-1]
+    shared["author"] = {"uid": "partner", "nickname": "partner", "sec_uid": "partner"}
+    page_items = works if shared_source == "post_response" else works[:-1]
+    handlers = []
+    page = SimpleNamespace(url="about:blank", title=AsyncMock(return_value="test"),
+                           is_closed=lambda: False, waited_ms=0)
+
+    async def wait_for_timeout(milliseconds):
+        page.waited_ms += milliseconds
+        await asyncio.sleep(0)
+
+    page.wait_for_timeout = wait_for_timeout
+
+    async def goto(url, **_kwargs):
+        page.url = url
+        response = SimpleNamespace(
+            url="https://" + post_host + "/aweme/v1/web/aweme/post/?sec_user_id=target",
+            status=200, json=AsyncMock(return_value={
+                "status_code": 0, "aweme_list": page_items, "has_more": 0}))
+        for handler in handlers:
+            handler(response)
+        await asyncio.sleep(0)
+
+    page.goto = goto
+    page.on = lambda _event, callback: handlers.append(callback)
+    page.remove_listener = lambda _event, callback: handlers.remove(callback)
+    context = SimpleNamespace(cookies=AsyncMock(return_value=[]))
+
+    @asynccontextmanager
+    async def browser_page(**_kwargs):
+        yield context, page
+
+    monkeypatch.setattr(api, "_browser_page", browser_page)
+    monkeypatch.setattr(api, "_check_browser_user_available", AsyncMock())
+    async def extract_cards(_page):
+        visible = shared_source == "profile_card" or (
+            shared_source == "delayed_profile_card" and page.waited_ms >= 2000)
+        return [work["aweme_id"] for work in works] if visible else []
+    monkeypatch.setattr(api, "_extract_aweme_ids_from_page", extract_cards)
+    monkeypatch.setattr(api, "get_video_detail", AsyncMock(return_value=shared))
+    monkeypatch.setattr(api, "get_user_info", AsyncMock(return_value={
+        "uid": "target-id", "sec_uid": "target", "nickname": "target", "aweme_count": 39}))
+    monkeypatch.setattr(downloader, "_should_download", AsyncMock(return_value=True))
+    download = AsyncMock(return_value=True)
+    monkeypatch.setattr(downloader, "_download_aweme_assets", download)
+
+    result = await downloader.download({"sec_uid": "target"})
+    assert result.total == result.success == (40 if include_pinned else 39)
+    downloaded_ids = [call.args[0]["aweme_id"] for call in download.await_args_list]
+    assert shared["aweme_id"] in downloaded_ids
+    assert (works[0]["aweme_id"] in downloaded_ids) is include_pinned
+    assert all(call.kwargs["author_sec_uid"] == "target" for call in download.await_args_list)
+    assert shared["author"]["sec_uid"] == "partner"  # Preserve the original creator metadata.
+    assert handlers == []
+    await api.close()
+
+
+async def test_late_profile_card_can_confirm_a_previously_unverified_coauthored_item(tmp_path, monkeypatch):
+    downloader = _build_downloader(tmp_path, mode=["post"])
+    downloader.stream_downloads = True
+    downloader.config._data["browser_fallback"]["enabled"] = True
+    downloader.api_client.prefer_browser_posts = True
+    shared = {**_make_aweme("shared"), "author": {"sec_uid": "partner"}}
+    confirmed = False
+
+    async def browser(_uid, *, on_items, **_kwargs):
+        nonlocal confirmed
+        await on_items([shared])  # No target-list evidence at this instant.
+        confirmed = True  # A scoped card appears later in the target profile.
+        return ["shared"]
+
+    monkeypatch.setattr(downloader.api_client, "collect_user_post_ids_via_browser", browser, raising=False)
+    monkeypatch.setattr(downloader.api_client, "browser_post_belongs_to_profile",
+                        lambda key, _uid: confirmed and key == "shared", raising=False)
+    monkeypatch.setattr(downloader.api_client, "pop_browser_post_stats", lambda: {"complete": True}, raising=False)
+    monkeypatch.setattr(downloader.api_client, "get_video_detail", AsyncMock(return_value=shared), raising=False)
+    monkeypatch.setattr(downloader, "_process_mode_aweme", AsyncMock(return_value={"status": "success"}))
+    result = await downloader.download({"sec_uid": "target"})
+    assert result.total == result.success == 1
 
 
 def test_post_strategy_browser_recovery_counts_filtered_media(tmp_path, monkeypatch):

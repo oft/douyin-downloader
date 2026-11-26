@@ -54,7 +54,7 @@ class PostDownloadPipeline:
                     await self.downloader.database.add_aweme({
                         "aweme_id": key, "aweme_type": self.downloader._detect_media_type(item),
                         "title": item.get("desc"), "author_id": author.get("uid"),
-                        "author_name": author.get("nickname") or self.author_name,
+                        "author_name": self.author_name,
                         "author_sec_uid": self.sec_uid, "create_time": item.get("create_time"),
                     })
                 self.result.total += 1

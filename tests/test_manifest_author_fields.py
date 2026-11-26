@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -182,6 +184,26 @@ async def test_video_manifest_prefers_explicit_sec_uid_over_payload(tmp_path, mo
     assert record["author_sec_uid"] == SEC_UID
     assert record["author_url"] == f"https://www.douyin.com/user/{SEC_UID}"
 
+    await api_client.close()
+
+
+@pytest.mark.parametrize("mode", ["post", "like"])
+async def test_coauthored_post_keeps_profile_database_identity_and_original_metadata(
+        tmp_path, monkeypatch, mode):
+    downloader, api_client = _build_video_downloader(tmp_path)
+    _stub_network(downloader, api_client, monkeypatch)
+    database = SimpleNamespace(add_aweme=AsyncMock())
+    downloader.database = database
+    payload = _video_payload("7600224486650122888", {
+        "uid": "partner-id", "nickname": "Partner", "sec_uid": "partner-sec"})
+    assert await downloader._download_aweme_assets(
+        payload, author_name="Target", mode=mode, author_sec_uid=SEC_UID)
+    row = database.add_aweme.await_args.args[0]
+    assert row["author_sec_uid"] == (SEC_UID if mode == "post" else "partner-sec")
+    assert row["author_name"] == ("Target" if mode == "post" else "Partner")
+    assert json.loads(row["metadata"])["author"]["sec_uid"] == "partner-sec"
+    assert _manifest_records(tmp_path)[-1]["author_name"] == (
+        "Target" if mode == "post" else "Partner")
     await api_client.close()
 
 

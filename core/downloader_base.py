@@ -970,6 +970,12 @@ class BaseDownloader(ABC):
             )
 
         author = aweme_data.get("author", {})
+        # Post listings belong to the requested profile, including coauthored
+        # works whose original author block names another creator. Keep that
+        # original block in JSON, but do not move the library row to the partner.
+        profile_post = mode == "post" and bool(author_sec_uid)
+        stored_author_name = author_name if profile_post else author.get("nickname", author_name)
+        stored_author_uid = author_sec_uid if profile_post else extract_author_sec_uid(aweme_data)
         if self.database:
             metadata_json = json.dumps(aweme_data, ensure_ascii=False)
             cover_list = extract_video_cover_urls(aweme_data)
@@ -985,7 +991,7 @@ class BaseDownloader(ABC):
                 "aweme_type": media_type,
                 "title": desc,
                 "author_id": author.get("uid"),
-                "author_name": author.get("nickname", author_name),
+                "author_name": stored_author_name,
                 "create_time": aweme_data.get("create_time"),
                 "file_path": str(save_dir),
                 "metadata": metadata_json,
@@ -993,7 +999,7 @@ class BaseDownloader(ABC):
                 # (add_aweme_batch iterates `record["author_sec_uid"]`) and
                 # the single-write path (add_aweme reads the payload as
                 # fallback when the kwarg is None) pick it up identically.
-                "author_sec_uid": extract_author_sec_uid(aweme_data),
+                "author_sec_uid": stored_author_uid,
                 "cover_urls": json.dumps(
                     order_cover_mirrors(cover_list if isinstance(cover_list, list) else [])
                 ),
@@ -1013,7 +1019,7 @@ class BaseDownloader(ABC):
         manifest_record = {
             "date": publish_date,
             "aweme_id": aweme_id,
-            "author_name": author.get("nickname", author_name),
+            "author_name": stored_author_name,
             # Fixed schema — always present, "" when unknown — so manifest
             # consumers never branch on a missing key. `author_name` alone
             # cannot survive a nickname change or a collision.

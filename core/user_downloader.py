@@ -582,12 +582,24 @@ class UserDownloader(BaseDownloader):
         stream_seen = {str(item.get("aweme_id")) for item in aweme_list}
         ignored_browser_ids = set()
 
+        def listed_in_profile(aweme_id):
+            checker = getattr(self.api_client, "browser_post_belongs_to_profile", None)
+            return callable(checker) and checker(str(aweme_id), sec_uid) is True
+
+        def belongs_to_profile(item):
+            author = item.get("author") or {}
+            author_uid = author.get("sec_uid")
+            if not author_uid or str(author_uid) == str(sec_uid):
+                return True
+            # A coauthored work can name its other creator as the primary author.
+            # Accept that mismatch only with evidence from this target's list.
+            return listed_in_profile(item.get("aweme_id") or "")
+
         async def deliver(items):
             fresh = []
             for item in items:
                 key = str(item.get("aweme_id") or "")
-                author = item.get("author") or {}
-                if author.get("sec_uid") and str(author["sec_uid"]) != str(sec_uid):
+                if not belongs_to_profile(item):
                     ignored_browser_ids.add(key)
                     continue
                 if not key or key in stream_seen:
@@ -666,7 +678,8 @@ class UserDownloader(BaseDownloader):
 
         existing_ids = {str(item.get("aweme_id")) for item in aweme_list if item.get("aweme_id")}
         missing_ids = [aweme_id for aweme_id in browser_aweme_ids
-                       if aweme_id not in existing_ids and aweme_id not in ignored_browser_ids]
+                       if aweme_id not in existing_ids
+                       and (aweme_id not in ignored_browser_ids or listed_in_profile(aweme_id))]
         if not missing_ids:
             logger.info(
                 "Browser fallback found no missing items: browser_ids=%s existing=%s "
@@ -714,7 +727,7 @@ class UserDownloader(BaseDownloader):
                 continue
             author = detail.get("author", {}) if isinstance(detail, dict) else {}
             detail_sec_uid = author.get("sec_uid") if isinstance(author, dict) else None
-            if detail_sec_uid and str(detail_sec_uid) != str(sec_uid):
+            if not belongs_to_profile(detail):
                 logger.warning(
                     "Skip aweme_id=%s due to mismatched sec_uid (%s)",
                     aweme_id,
