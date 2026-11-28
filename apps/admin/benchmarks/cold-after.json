@@ -1,0 +1,41 @@
+{
+  "fixture": {
+    "works": 30000,
+    "authors": 100,
+    "offline": true
+  },
+  "runtime": "v24.22.2",
+  "results": {
+    "assembly": {
+      "p50Ms": 138.45,
+      "p95Ms": 167.96,
+      "samples": 8
+    },
+    "coldClone": {
+      "p50Ms": 103.36,
+      "p95Ms": 117.59,
+      "samples": 8
+    },
+    "unchanged": {
+      "p50Ms": 33.06,
+      "p95Ms": 40.22,
+      "samples": 8
+    },
+    "titleEdit": {
+      "p50Ms": 50.46,
+      "p95Ms": 65.31,
+      "samples": 8
+    }
+  },
+  "titlePatchBytes": {
+    "min": 1287,
+    "max": 1287
+  },
+  "memoryMiB": {
+    "rss": 1143.3,
+    "heapTotal": 366.8,
+    "heapUsed": 168.2,
+    "external": 9,
+    "arrayBuffers": 0.1
+  }
+}

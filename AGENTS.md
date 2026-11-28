@@ -21,6 +21,10 @@ A Python-based Douyin (TikTok China) batch downloader that fetches videos, galle
 
 | Directory | Purpose |
 |-----------|---------|
+| `apps/admin/` | 资料库 API、后台任务、媒体读取和管理静态文件托管 |
+| `apps/admin-web/` | Vue 3 管理界面，通过 Vite 独立开发和构建 |
+| `apps/viewer/` | 只读视频浏览服务，通过 admin API 读取数据 |
+| `apps/python-bridge/` | 管理端调用 Python 的解释器选择、命令和子进程控制 |
 | `agent_mode/` | CLI-only `douyin-dl agent <verb>` mode — one JSON envelope per run, stable error and exit codes |
 | `auth/` | Cookie and MS token management (see `auth/AGENTS.md`) |
 | `cli/` | CLI argument parsing, main async loop, progress display (see `cli/AGENTS.md`) |
@@ -109,4 +113,19 @@ A Python-based Douyin (TikTok China) batch downloader that fetches videos, galle
 
 - This fork intentionally stores full work metadata in JSON files and compact image/path fields in SQLite. Changes in storage/database.py, storage/metadata_files.py and storage/metadata_handler.py diverge from the desktop sibling for this storage model.
 
+- Local-library batch extensions in this fork intentionally diverge from the desktop: `core/local_media_index.py`, `core/post_incremental.py`, `storage/local_media_registry.py`, `storage/library_update_state.py`, and their integration in `cli/main.py`, `core/browser_session.py`, `core/downloader_base.py`, `core/post_pipeline.py`, `core/user_downloader.py`, `core/user_modes/post_strategy.py`, and `core/api_client.py`. They provide shared per-run file evidence, explicit manual scans, persisted backlog and library-only time budgets. Preserve the existing page-bridge/Argus routing. The local SQLite transaction and queue changes ship with this fork; desktop parity has not been claimed because neither documented desktop checkout exists on this machine. Compare and port those changes explicitly when that checkout is available, rather than blindly overwriting this fork with the sync script.
+
 - Stored work file paths are relative to the configured download root. Pass download_root when constructing Database in download entry points. The library reads the downloader YAML configuration to resolve these paths.
+
+### Local applications
+
+- First-time library setup: install Python dependencies, then run `python apps/admin/scripts/setup-library.py --init` from the repository root. Without `--init`, it checks an existing configuration and database without creating a replacement. See `apps/README.md` for clean-clone setup on macOS/Linux/Windows.
+- Admin defaults to loopback port 3001; viewer defaults to port 3002. Keep each library's media root and database paired, with a separate database directory per library. Paths are startup configuration; restart admin after changing them. Do not implement hot switching without library identity checks, task exclusion and stale-request protection.
+- Reviews default to `<database>.reviews.json`; legacy `apps/admin/data/catalog-reviews.json` must be explicitly associated with its old database. Runtime databases, media, credentials, machine-specific plist files and local diagnostics are excluded from Git.
+- Install in `apps/` with `bun install --frozen-lockfile`; use `bun run check` and `bun run test` for both apps.
+- Start with `bun run --filter @zqdouyin/admin start` or `bun run --filter @zqdouyin/viewer start` from `apps/`. Both start scripts run Node. Build the admin UI first with `bun run build` in `apps/`.
+- Admin frontend dev: `bun run --filter @zqdouyin/admin-web dev` with admin on port 3001. Production assets use `/_admin/` to keep the legacy media `/assets/` route separate.
+- Admin uses `@zqdouyin/python-bridge` for command construction and child process control. Keep app-specific progress and persisted job state in admin.
+- Repository paths are centralized in `apps/admin/util/project-paths.ts` and `apps/admin/scripts/project_paths.py`; do not resolve the repository from the process working directory.
+- Root `config.yml`, `data/`, `logs/` and configured media paths remain shared. Each package declares its dependencies and `apps/bun.lock` locks all workspace versions.
+- LaunchAgent labels and deployed domains retain their existing names; viewer browser storage keys retain `video-web:*` to preserve saved items and sound preferences.

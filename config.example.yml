@@ -1,5 +1,5 @@
-link:
-  - https://www.douyin.com/user/MS4wLjABAAAA6O7EZyfDRYXxJrUTpf91K3tmB4rBROkAw-nYMfld8ss
+# 在管理页添加作者链接，或在此填写自己的公开主页链接。
+link: []
 
 path: ./Downloaded/
 
@@ -65,11 +65,16 @@ increase:
   mix: true
   music: true
 
+# 资料库日常更新：本地达到已确认的主页总量且整页普通作品已保存时允许停止分页。
+# 本地少于总量，或总量/共创统计范围未知时完整遍历；本地多出的历史作品保留。
+# 设为 false 可完整遍历历史并保留下载去重；普通 CLI 不启用此优化。
+incremental_page_stop: true
+
 thread: 5
 retry_times: 3
 proxy: ""
 database: true
-database_path: dy_downloader.db
+database_path: ./data/dy_downloader.db
 
 # 视频下载画质。抖音 API 为每个视频返回多档码率，此选项决定选用哪一档：
 #   original                 - 原画：探测上传原片（转码档列表之外，可比最高

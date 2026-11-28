@@ -187,7 +187,9 @@ async def download_url(
             result = await downloader.download(parsed)
         except UserUnavailableError as exc:
             output.print_warning(f"跳过用户主页 {url}：{exc.reason}")
-            return DownloadResult()
+            result = DownloadResult()
+            result.unavailable_reason = exc.reason
+            return result
         except (LoginRequiredError, BrowserUnavailableError, BrowserPageAccessError):
             # 交给 _run_with_relogin 重新登录后重试；恢复不了时由调用方记为该 URL 失败。
             raise
@@ -241,7 +243,8 @@ async def download_url(
 
 
 async def main_async(args, *, database_path=None, on_download_ready=None, progress_reporter=None,
-                     browser_preflight=False, url_scheduler=None, stream_downloads=False):
+                     browser_preflight=False, url_scheduler=None, stream_downloads=False,
+                     automatic_local_media_scan=None, library_update_tracking=False):
     reporter = progress_reporter if progress_reporter is not None else display
     if not args.serve:
         reporter.show_banner()
@@ -271,6 +274,10 @@ async def main_async(args, *, database_path=None, on_download_ready=None, progre
 
     if args.path:
         config.update(path=args.path)
+    if automatic_local_media_scan is not None:
+        config.update(automatic_local_media_scan=bool(automatic_local_media_scan))
+    if library_update_tracking:
+        config.update(library_update_tracking=True)
 
     # 独立子命令：热榜 / 搜索 / 服务
     if args.hot_board is not None or args.search:
@@ -331,6 +338,9 @@ async def main_async(args, *, database_path=None, on_download_ready=None, progre
         )
         database = Database(db_path=str(db_path), download_root=config.get("path"))
         await database.initialize()
+        if library_update_tracking:
+            from storage.library_update_state import ensure_library_state
+            await ensure_library_state(database)
         reporter.print_success("Database initialized")
     await _recover_live_recordings(database, config)
 

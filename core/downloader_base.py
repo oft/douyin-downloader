@@ -16,6 +16,7 @@ from control import QueueManager, RateLimiter, RetryHandler
 from core import item_reasons
 from core.api_client import DouyinAPIClient
 from core.comments_collector import CommentsCollector, needs_backfill, read_comments_state
+from core.local_media_index import LocalMediaIndexes, cached_media_exists, registered_media_exists
 from core.metadata import (
     build_author_home_url,
     extract_author_sec_uid,
@@ -25,7 +26,8 @@ from core.output_naming import plan_output_paths
 from core.transcript_manager import TranscriptManager
 from storage import Database, FileManager, MetadataHandler
 from storage.database import order_cover_mirrors
-from utils.legacy_names import LegacyNameIndex
+from storage.local_media_registry import recorded_media_path
+from utils.legacy_names import LegacyNameIndex, legacy_name_keys
 from utils.logger import setup_logger
 from utils.naming import build_aweme_context
 from utils.paid_content import (
@@ -119,6 +121,13 @@ class BaseDownloader(ABC):
         self.metadata_handler = MetadataHandler()
         self.transcript_manager = TranscriptManager(self.config, self.file_manager, self.database)
         self._local_aweme_ids: Optional[set[str]] = None
+        indexes = getattr(getattr(api_client, 'browser_session', None), 'local_media_indexes', None)
+        self._batch_media_indexes = indexes if isinstance(indexes, LocalMediaIndexes) else None
+        self._local_aweme_paths = None
+        self._local_legacy_paths = None
+        self._index_diagnostic_sent = False
+        self._local_index_entries = 0
+        self._index_progress_loop = None
         # 与 _local_aweme_ids 同一次扫描建出：旧版截掉了作品 ID 的文件名。
         self._legacy_names: Optional[LegacyNameIndex] = None
         # 延迟到事件循环内创建（3.9 上 asyncio.Lock() 在无运行循环时创建
@@ -375,8 +384,35 @@ class BaseDownloader(ABC):
         if force:
             return True
 
+        if await registered_media_exists(self.database, aweme_id, self.file_manager.base_path):
+            return self._note_item_reason(aweme_id, item_reasons.SKIP_LOCAL_FILE_EXISTS)
+        if not self._automatic_local_media_scan_enabled():
+            _, publish_date = self._resolve_publish_time((aweme or {}).get('create_time'))
+            recorded = await recorded_media_path(self.database, aweme_id, self.file_manager.base_path,
+                                                  publish_date, (aweme or {}).get('desc', ''))
+            if recorded:
+                # A manually discovered copy becomes the normal recorded path for this work.
+                # The shared connection may have another worker's uncommitted write.
+                # Path repair must use the same transaction lock as normal upserts.
+                async with self.database._write_transaction() as db:
+                    rows = await db.execute_fetchall('SELECT file_path FROM aweme WHERE aweme_id=?', (aweme_id,))
+                    current = rows[0] if rows else None
+                    if await registered_media_exists(self.database, aweme_id, self.file_manager.base_path):
+                        return self._note_item_reason(aweme_id, item_reasons.SKIP_LOCAL_FILE_EXISTS)
+                    if current:
+                        await db.execute("UPDATE aweme SET file_path=? WHERE aweme_id=? AND COALESCE(file_path,'')=?",
+                                         (recorded, aweme_id, current[0] or ''))
+                return self._note_item_reason(aweme_id, item_reasons.SKIP_LOCAL_FILE_EXISTS)
         await self._ensure_local_aweme_index()
-        if self._is_locally_downloaded(aweme_id) or self._matches_legacy_name(aweme):
+        if self._local_aweme_paths is not None:
+            _, publish_date = self._resolve_publish_time((aweme or {}).get('create_time'))
+            present = await asyncio.get_running_loop().run_in_executor(
+                None, cached_media_exists, aweme_id, self._local_aweme_paths,
+                self._local_legacy_paths, publish_date, (aweme or {}).get('desc', '').strip() or 'no_title',
+                self.file_manager.base_path)
+        else:
+            present = self._is_locally_downloaded(aweme_id) or self._matches_legacy_name(aweme)
+        if present:
             logger.info("Aweme %s already exists locally, skipping", aweme_id)
             return self._note_item_reason(aweme_id, item_reasons.SKIP_LOCAL_FILE_EXISTS)
 
@@ -415,6 +451,37 @@ class BaseDownloader(ABC):
         /health 失联后强杀后台服务、丢掉运行中的 job。加锁避免并发
         worker 对同一根目录重复扫描。
         """
+        if not self._automatic_local_media_scan_enabled():
+            if self._local_aweme_ids is None:
+                if self._batch_media_indexes is not None:
+                    value, _reused = await self._batch_media_indexes.get(
+                        self.file_manager.base_path, lambda: (set(), LegacyNameIndex(), {}, {}, 0))
+                    (self._local_aweme_ids, self._legacy_names, self._local_aweme_paths,
+                     self._local_legacy_paths, self._local_index_entries) = value
+                else:
+                    self._empty_local_media_index()
+            return
+        if self._batch_media_indexes is not None:
+            started = time.monotonic()
+            self._index_progress_loop = asyncio.get_running_loop()
+            def build():
+                self._build_local_aweme_index()
+                return (self._local_aweme_ids, self._legacy_names,
+                        self._local_aweme_paths, self._local_legacy_paths, self._local_index_entries)
+            def report_start():
+                self._progress_update_step('本地文件索引', '首次兼容扫描媒体目录，本轮其他作者将复用结果')
+            value, reused = await self._batch_media_indexes.get(self.file_manager.base_path, build, report_start)
+            (self._local_aweme_ids, self._legacy_names, self._local_aweme_paths,
+             self._local_legacy_paths, self._local_index_entries) = value
+            if not self._index_diagnostic_sent:
+                self._index_diagnostic_sent = True
+                callback = getattr(self.progress_reporter, 'on_diagnostic', None)
+                if callable(callback):
+                    callback('local_index', reused=reused, elapsedMs=round((time.monotonic()-started)*1000),
+                             works=len(self._local_aweme_ids), entries=self._local_index_entries)
+                self._progress_update_step('本地核对完成', '复用本轮文件索引' if reused else
+                                           '文件索引已就绪，继续处理作品')
+            return
         if self._local_aweme_ids is not None:
             return
         lock = self._local_index_build_lock
@@ -430,7 +497,10 @@ class BaseDownloader(ABC):
             return False
 
         if self._local_aweme_ids is None:
-            self._build_local_aweme_index()
+            if self._automatic_local_media_scan_enabled():
+                self._build_local_aweme_index()
+            else:
+                self._empty_local_media_index()
 
         if self._local_aweme_ids is None:
             return False
@@ -449,9 +519,16 @@ class BaseDownloader(ABC):
         base_path = self.file_manager.base_path
         aweme_ids: set[str] = set()
         legacy_names = LegacyNameIndex()
+        paths, legacy_paths = {}, {}
+        self._local_index_entries = 0
 
         if base_path.exists():
             for path in base_path.rglob("*"):
+                self._local_index_entries += 1
+                loop = getattr(self, '_index_progress_loop', None)
+                if loop is not None and not loop.is_closed() and self._local_index_entries % 50000 == 0:
+                    loop.call_soon_threadsafe(self._progress_update_step, '本地文件索引',
+                                             '已检查 {} 个目录项'.format(self._local_index_entries))
                 if path.name.startswith("._"):
                     continue  # exFAT AppleDouble sidecars are not downloaded media.
                 if not path.is_file():
@@ -471,11 +548,16 @@ class BaseDownloader(ABC):
                     continue
                 for match in self._aweme_id_pattern.finditer(path.name):
                     aweme_ids.add(match.group(1))
+                    paths.setdefault(match.group(1), []).append(path)
                 legacy_names.add(path.stem)
+                for publish_date, _ in legacy_name_keys(path.stem):
+                    legacy_paths.setdefault(publish_date, []).append(path)
 
         # 先放旧版名索引：_local_aweme_ids 非 None 即视为索引已建好。
         self._legacy_names = legacy_names
         self._local_aweme_ids = aweme_ids
+        self._local_aweme_paths = paths
+        self._local_legacy_paths = legacy_paths
 
     def _mark_local_aweme_downloaded(self, aweme_id: str):
         if not aweme_id:
@@ -485,10 +567,23 @@ class BaseDownloader(ABC):
             # retry_executor 直接调用 _download_aweme_assets（不经过
             # _should_download），此时索引还未建；先建立本任务的索引，
             # 再把刚下载的作品加入其中。
-            self._build_local_aweme_index()
+            if self._automatic_local_media_scan_enabled():
+                self._build_local_aweme_index()
+            else:
+                self._empty_local_media_index()
         if self._local_aweme_ids is None:  # pragma: no cover — 防御
             self._local_aweme_ids = set()
         self._local_aweme_ids.add(aweme_id)
+
+    def _automatic_local_media_scan_enabled(self):
+        value = self.config.get('automatic_local_media_scan', True)
+        return value.strip().lower() not in {'0', 'false', 'off', 'no'} if isinstance(value, str) else bool(value)
+
+    def _empty_local_media_index(self):
+        self._local_aweme_ids = set()
+        self._legacy_names = LegacyNameIndex()
+        self._local_aweme_paths, self._local_legacy_paths = {}, {}
+        self._local_index_entries = 0
 
     def _time_range_bounds(self) -> Tuple[Optional[int], Optional[int]]:
         start_time = self.config.get("start_time")
@@ -1056,6 +1151,10 @@ class BaseDownloader(ABC):
                 )
 
         if primary_media_downloaded:
+            if self._local_aweme_paths is not None:
+                self._local_aweme_paths[aweme_id] = [path for path in downloaded_files
+                    if path.suffix.lower() in self._local_media_suffixes
+                    and not path.stem.lower().endswith(('_cover', '_avatar', '_music'))]
             self._mark_local_aweme_downloaded(aweme_id)
         logger.info("Downloaded selected assets for %s: %s (%s)", media_type, desc, aweme_id)
         return True

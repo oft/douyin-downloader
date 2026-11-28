@@ -293,3 +293,65 @@ async def test_non_json_response_keeps_sanitized_type_diagnostics(collector):
 async def test_preflight_response_is_not_misclassified_as_author_post_data(collector):
     client, _page = collector([{"_http_status": 403, "_method": "OPTIONS"}, post_page(0, has_more=0)])
     assert len(await client.collect_user_post_ids_via_browser("test")) == 18
+
+
+async def test_first_page_budget_stops_empty_author_without_waiting_all_idle_rounds(collector, monkeypatch):
+    import core.api_client as module
+    clock = [0.0]
+    monkeypatch.setattr(module, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    client, page = collector([])
+    original_wait = page.wait_for_timeout
+    async def wait(ms):
+        clock[0] += ms / 1000
+        await original_wait(ms)
+    page.wait_for_timeout = wait
+    assert await client.collect_user_post_ids_via_browser('test', first_page_timeout_seconds=2, on_items=AsyncMock()) == []
+    stats = client.pop_browser_post_stats()
+    assert stats['stop_reason'] == 'first_page_timeout' and not stats['complete']
+    assert page.waited_ms <= 2400 and page.handlers == []
+
+
+async def test_first_payload_delivery_can_wait_for_downloads_beyond_first_page_budget(collector, monkeypatch):
+    import core.api_client as module
+    clock = [0.0]
+    monkeypatch.setattr(module, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    client, page = collector([post_page(0, has_more=0)])
+    async def deliver(items):
+        clock[0] += 40
+        await asyncio.sleep(0)
+        return True
+    ids = await client.collect_user_post_ids_via_browser('test', first_page_timeout_seconds=2, on_items=deliver)
+    assert len(ids) == 18 and client.pop_browser_post_stats()['complete']
+    assert page.handlers == []
+
+
+async def test_tracking_captcha_stops_batch_instead_of_cycling_accounts(collector):
+    from core.api_client import BrowserPageAccessError
+    client, page = collector([])
+    page.title = AsyncMock(return_value='安全验证')
+    with pytest.raises(BrowserPageAccessError):
+        await client.collect_user_post_ids_via_browser('test', first_page_timeout_seconds=2, on_items=AsyncMock())
+    assert page.handlers == []
+
+
+async def test_first_response_body_timeout_does_not_cancel_the_author_batch(collector):
+    client, page = collector([])
+    cancelled = asyncio.Event()
+    async def body():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+    async def navigate(url, **kwargs):
+        page.url = url
+        response = SimpleNamespace(url='https://www.douyin.com/aweme/v1/web/aweme/post/?sec_user_id=test',
+            status=200, json=body, headers={}, request=SimpleNamespace(method='GET'))
+        for handler in page.handlers:
+            handler(response)
+        await asyncio.sleep(0)
+    page.goto = navigate
+    ids = await asyncio.wait_for(client.collect_user_post_ids_via_browser(
+        'test', first_page_timeout_seconds=1, on_items=AsyncMock()), 3)
+    assert ids == [] and cancelled.is_set()
+    assert client.pop_browser_post_stats()['stop_reason'] == 'first_page_timeout'
+    assert not page.handlers

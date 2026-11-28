@@ -919,3 +919,19 @@ def test_browser_backend_missing_reason_matches_the_runtime(tmp_path, monkeypatc
 
     monkeypatch.delattr(sys, "frozen", raising=False)
     assert "playwright" in downloader._browser_backend_missing_reason()
+
+
+async def test_library_profile_timeout_is_bounded_and_leaves_local_data_alone(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+    downloader = _build_downloader(tmp_path, _FakeAPIClient(), browser_enabled=True)
+    downloader.config._data.update(library_update_tracking=True, library_profile_timeout_seconds=.01)
+    callback = Mock()
+    downloader.progress_reporter = type('Reporter', (), {'on_diagnostic': callback})()
+    async def stuck(*args):
+        await asyncio.Event().wait()
+    monkeypatch.setattr(downloader, '_resolve_user_info_logged', stuck)
+    monkeypatch.setattr(downloader, '_save_author_home_url', AsyncMock())
+    with pytest.raises(RuntimeError, match='资料获取超过'):
+        await asyncio.wait_for(downloader.download({'sec_uid': 'test'}), 1)
+    callback.assert_called_with('author_budget', phase='profile', budgetMs=10)
+    downloader._save_author_home_url.assert_not_awaited()

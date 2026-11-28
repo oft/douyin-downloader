@@ -14,6 +14,31 @@
 
 <a id="douzy-desktop"></a>
 
+## Local library apps
+
+`apps/admin-web` contains the Vue administration UI; `apps/admin` provides the API, background jobs, and the built frontend; `apps/viewer` provides read-only video browsing. The Python downloader stays in `core/`, `storage/`, and `cli/`. Configuration, databases, and logs remain at the repository root (`config.yml`, `data/`, `logs/`).
+
+Install Python 3.10+, Node.js 24.12+, and Bun 1.4.2. Initialize an empty local library from the repository root:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -e ".[browser]"
+.venv/bin/python -m playwright install chromium
+.venv/bin/python apps/admin/scripts/setup-library.py --init
+cd apps
+bun install --frozen-lockfile
+bun run build
+bun run --filter @zqdouyin/admin start
+# In another terminal, from apps/
+bun run --filter @zqdouyin/viewer start
+```
+
+Run `bun run check` and `bun run test` from `apps/` to verify both applications. `apps/python-bridge` adapts Python for the admin application.
+
+Open the [admin UI](http://127.0.0.1:3001), add your own author links, and sign in before starting downloads. Configuration and credentials are local and excluded from Git. Media and database locations are read at startup; changing them requires an admin restart. Use a separate database directory for each library, including temporary internal-disk use, to keep download history and transfer state separate.
+
+[Installation, Windows setup and library switching](apps/README.md) · [Admin documentation](apps/admin/README.md) · [Viewer documentation](apps/viewer/README.md)
+
 ## Sponsors
 
 <table>

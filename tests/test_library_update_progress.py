@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parents[1] / "library-server" / "scripts" / "update_progress.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "apps" / "admin" / "scripts" / "update_progress.py"
 spec = importlib.util.spec_from_file_location("library_update_progress", SCRIPT)
 progress = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(progress)
@@ -143,3 +143,48 @@ async def test_slow_progress_reader_cannot_block_download_callbacks():
     finally:
         release.set()
         await pipe.close()
+
+
+def test_stream_counters_are_author_scoped_and_fast_skips_settle_without_item_callbacks():
+    events = []
+    reporter = progress.LibraryProgressDisplay(events.append)
+    reporter.start_url(1, 2, 'first')
+    reporter.complete_url(result(success=100))
+    reporter.start_url(2, 2, 'second')
+    reporter.on_stream_progress(discovered=29, queued=4, active=2, listing_state='collecting',
+                                received=31, new=7, existing=20, repair=2,
+                                downloaded=3, failed=0, skipped=20)
+    reporter.stop_download_session()
+    final = events[-1]
+    assert final['success'] == 103
+    assert final['skipped'] == 20
+    assert final['receivedItems'] == 31 and final['newItems'] == 7
+    assert final['downloadedItems'] == 3 and final['existingItems'] == 20
+    assert final['itemsCompleted'] == 23
+    reporter.start_url(2, 2, 'third')
+    assert 'newItems' not in events[-1] and 'downloadedItems' not in events[-1]
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_events_preserve_index_timing_and_remove_secrets(tmp_path):
+    script = SCRIPT.parent / 'update_diagnostics.py'
+    spec = importlib.util.spec_from_file_location('library_update_diagnostics', script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    file = tmp_path / 'timings.jsonl'
+    diagnostic = module.UpdateDiagnostics(file)
+    reporter = progress.LibraryProgressDisplay(lambda _value: None, diagnostics=diagnostic)
+    reporter.start_url(1, 2, 'https://user:password@www.douyin.com/user/test?cookie=hidden')
+    reporter.on_author(nickname='作者')
+    reporter.update_step('本地文件索引', '扫描')
+    reporter.on_diagnostic('local_index', elapsedMs=74000, reused=False, entries=500000, works=45000)
+    reporter.on_diagnostic('local_index', elapsedMs=0, reused=True, entries=500000, works=45000)
+    diagnostic.record('ignored-secrets', cookie='never-store-me', request_body='never-store-me')
+    reporter.complete_url(result(success=1))
+    await diagnostic.close()
+    text = file.read_text()
+    assert 'password' not in text and 'hidden' not in text and 'never-store-me' not in text
+    events = [json.loads(line) for line in text.splitlines()]
+    indexes = [event for event in events if event['event'] == 'local_index']
+    assert indexes[0]['elapsedMs'] == 74000 and indexes[1]['reused'] is True
+    assert events[-1]['event'] == 'author_finished' and events[-1]['author'] == '作者'

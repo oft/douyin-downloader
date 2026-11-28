@@ -1,0 +1,101 @@
+{
+  "fixture": {
+    "works": 30000,
+    "authors": 100,
+    "materializedWorks": 24,
+    "offline": true
+  },
+  "runtime": "v24.22.2",
+  "platform": "darwin/arm64",
+  "results": {
+    "coldCatalog": {
+      "p50Ms": 746.1,
+      "p95Ms": 746.1,
+      "maxLoopDelayMs": 11.56,
+      "bytes": 250,
+      "samples": 1
+    },
+    "status": {
+      "p50Ms": 0.17,
+      "p95Ms": 0.42,
+      "maxLoopDelayMs": 0,
+      "bytes": 250,
+      "samples": 36
+    },
+    "works": {
+      "p50Ms": 1.26,
+      "p95Ms": 5.79,
+      "maxLoopDelayMs": 10.9,
+      "bytes": 3827,
+      "samples": 36
+    },
+    "summary": {
+      "p50Ms": 0.56,
+      "p95Ms": 0.99,
+      "maxLoopDelayMs": 10.4,
+      "bytes": 48,
+      "samples": 36
+    },
+    "authors": {
+      "p50Ms": 1.3,
+      "p95Ms": 2.27,
+      "maxLoopDelayMs": 10.18,
+      "bytes": 3114,
+      "samples": 36
+    },
+    "authorWorks": {
+      "p50Ms": 0.51,
+      "p95Ms": 1.16,
+      "maxLoopDelayMs": 10.12,
+      "bytes": 3053,
+      "samples": 36
+    },
+    "search": {
+      "p50Ms": 6.32,
+      "p95Ms": 8.78,
+      "maxLoopDelayMs": 15.89,
+      "bytes": 3435,
+      "samples": 36
+    },
+    "detail": {
+      "p50Ms": 0.37,
+      "p95Ms": 0.62,
+      "maxLoopDelayMs": 0,
+      "bytes": 521,
+      "samples": 36
+    },
+    "mediaRange": {
+      "p50Ms": 0.36,
+      "p95Ms": 2.62,
+      "maxLoopDelayMs": 9.67,
+      "bytes": 1024,
+      "samples": 36
+    },
+    "queueWrites": {
+      "p50Ms": 120.33,
+      "p95Ms": 157.91,
+      "maxLoopDelayMs": 12.56,
+      "bytes": 250,
+      "samples": 36
+    },
+    "workWrites": {
+      "p50Ms": 150.09,
+      "p95Ms": 182.82,
+      "maxLoopDelayMs": 22.81,
+      "bytes": 250,
+      "samples": 12
+    },
+    "concurrent8": {
+      "p50Ms": 5.34,
+      "p95Ms": 7.06,
+      "samples": 36
+    }
+  },
+  "memoryMiB": {
+    "rss": 970.2,
+    "heapTotal": 209.1,
+    "heapUsed": 78.8,
+    "external": 11.4,
+    "arrayBuffers": 0.3
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "compilerOptions": {
+    "module": "NodeNext",
+    "types": ["node"]
+  },
+  "include": ["server.mjs", "tests/**/*.mjs"]
+}

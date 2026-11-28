@@ -1,0 +1,184 @@
+{
+  "runs": [
+    {
+      "firstPlayMs": 3459.7,
+      "switchMs": [
+        264.9,
+        257.9,
+        258.6
+      ],
+      "cards": 12,
+      "sources": 3,
+      "playing": 1,
+      "longTasks": [],
+      "api": [
+        {
+          "path": "/api/catalog/works",
+          "durationMs": 2998
+        },
+        {
+          "path": "/api/catalog/works",
+          "durationMs": 49
+        },
+        {
+          "path": "/api/catalog/authors/5d4445bd91ad2a3b046a0fe1",
+          "durationMs": 6
+        },
+        {
+          "path": "/api/catalog/authors/7019976d7f215c7c9d8b6f6f",
+          "durationMs": 15
+        },
+        {
+          "path": "/api/catalog/authors/639b9688967c201853b5ba3c",
+          "durationMs": 19
+        }
+      ]
+    },
+    {
+      "firstPlayMs": 116.6,
+      "switchMs": [
+        258.6,
+        257.2,
+        257.0
+      ],
+      "cards": 12,
+      "sources": 3,
+      "playing": 1,
+      "longTasks": [],
+      "api": [
+        {
+          "path": "/api/catalog/works",
+          "durationMs": 12
+        },
+        {
+          "path": "/api/catalog/works",
+          "durationMs": 23
+        },
+        {
+          "path": "/api/catalog/authors/44db7d3fe40512abcae1af87",
+          "durationMs": 4
+        },
+        {
+          "path": "/api/catalog/authors/fc2e9ecdc2b4a7277ea25448",
+          "durationMs": 7
+        },
+        {
+          "path": "/api/catalog/authors/6610e76186b27865138192e6",
+          "durationMs": 8
+        },
+        {
+          "path": "/api/catalog/authors/ac0a26e41a8283e1bd38e6b4",
+          "durationMs": 17
+        }
+      ]
+    },
+    {
+      "firstPlayMs": 204.6,
+      "switchMs": [
+        262.6,
+        256.0,
+        254.7
+      ],
+      "cards": 12,
+      "sources": 3,
+      "playing": 1,
+      "longTasks": [],
+      "api": [
+        {
+          "path": "/api/catalog/works",
+          "durationMs": 17
+        },
+        {
+          "path": "/api/catalog/works",
+          "durationMs": 45
+        },
+        {
+          "path": "/api/catalog/authors/eabd2750ab49082a83bd95fe",
+          "durationMs": 22
+        },
+        {
+          "path": "/api/catalog/authors/e58e511919cd32fc7671c268",
+          "durationMs": 16
+        },
+        {
+          "path": "/api/catalog/authors/45fc53083640eab80ba3c5e7",
+          "durationMs": 14
+        }
+      ]
+    },
+    {
+      "firstPlayMs": 164.8,
+      "switchMs": [
+        256.8,
+        257.8,
+        263.8
+      ],
+      "cards": 12,
+      "sources": 3,
+      "playing": 1,
+      "longTasks": [],
+      "api": [
+        {
+          "path": "/api/catalog/works",
+          "durationMs": 9
+        },
+        {
+          "path": "/api/catalog/works",
+          "durationMs": 17
+        },
+        {
+          "path": "/api/catalog/authors/44db7d3fe40512abcae1af87",
+          "durationMs": 4
+        },
+        {
+          "path": "/api/catalog/authors/860f015d3b281b387e210312",
+          "durationMs": 21
+        },
+        {
+          "path": "/api/catalog/authors/42465a00973ec42e99e8ef39",
+          "durationMs": 18
+        }
+      ]
+    },
+    {
+      "firstPlayMs": 124.3,
+      "switchMs": [
+        254.4,
+        254.8,
+        256.0
+      ],
+      "cards": 12,
+      "sources": 3,
+      "playing": 1,
+      "longTasks": [],
+      "api": [
+        {
+          "path": "/api/catalog/works",
+          "durationMs": 9
+        },
+        {
+          "path": "/api/catalog/works",
+          "durationMs": 20
+        },
+        {
+          "path": "/api/catalog/authors/cd61f9be6070754f35b99374",
+          "durationMs": 4
+        },
+        {
+          "path": "/api/catalog/authors/45fc53083640eab80ba3c5e7",
+          "durationMs": 4
+        },
+        {
+          "path": "/api/catalog/authors/5d22381936e8f6ed6abacef0",
+          "durationMs": 10
+        },
+        {
+          "path": "/api/catalog/authors/fc2e9ecdc2b4a7277ea25448",
+          "durationMs": 16
+        }
+      ]
+    }
+  ],
+  "firstPlayMedianMs": 164.8,
+  "note": "Real local library; concurrent downloads and media choice vary. Switch includes a fixed 250ms observation wait."
+}

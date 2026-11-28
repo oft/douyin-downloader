@@ -85,7 +85,7 @@ class PostUserModeStrategy(BaseUserModeStrategy):
         from core.post_pipeline import PostDownloadPipeline
 
         pipeline = PostDownloadPipeline(self, sec_uid, user_info, seen_aweme_ids)
-        self._item_sink = pipeline.offer
+        self._item_sink = pipeline.offer_page
         try:
             result = await pipeline.run(lambda: self.collect_items(sec_uid, user_info))
             self.incomplete_reason = result.incomplete_reason

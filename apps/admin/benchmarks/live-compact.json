@@ -1,0 +1,17 @@
+{
+  "base": "http://127.0.0.1:3001",
+  "observedWorks": 29232,
+  "observedAuthors": 107,
+  "statusRequestMs": 2174,
+  "list": {
+    "total": 28418,
+    "items": 12
+  },
+  "detail": 200,
+  "mediaRange": {
+    "status": 206,
+    "bytes": 1024
+  },
+  "conditionalMedia": 304,
+  "updateState": "idle"
+}

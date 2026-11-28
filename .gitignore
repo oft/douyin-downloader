@@ -17,6 +17,8 @@ dist/
 .eggs/
 *.egg-info/
 pip-wheel-metadata/
+/apps/node_modules/
+/apps/admin-web/node_modules/
 
 # Virtual environments
 .venv/
@@ -25,18 +27,22 @@ env/
 
 # OS files
 .DS_Store
+._*
 
 # Logs
 logs/
 *.log
 
 # Runtime output
+/data/
 Downloaded/
 Transcripts/
 dy_downloader.db
 *.db
 *.sqlite
 *.sqlite3
+*.db.reviews.json*
+*.sqlite.reviews.json*
 
 # Local config/secrets
 config*.yml
@@ -58,3 +64,17 @@ config/.cookies.json.*.tmp
 
 *.db-wal
 *.db-shm
+*.sqlite-wal
+*.sqlite-shm
+.library-transfer/
+
+data/import-backups/
+
+# Last local library update progress (no credentials)
+data/library-update-status.json*
+data/local-file-scan-status.json*
+data/library-diagnostics.json*
+
+# Machine-specific startup configuration and local tools
+/apps/admin/deployment/*.plist
+/apps/viewer/deployment/acceptance.json

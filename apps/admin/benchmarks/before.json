@@ -1,0 +1,101 @@
+{
+  "fixture": {
+    "works": 30000,
+    "authors": 100,
+    "materializedWorks": 24,
+    "offline": true
+  },
+  "runtime": "v24.22.2",
+  "platform": "darwin/arm64",
+  "results": {
+    "coldCatalog": {
+      "p50Ms": 1343.96,
+      "p95Ms": 1343.96,
+      "maxLoopDelayMs": 18.92,
+      "bytes": 250,
+      "samples": 1
+    },
+    "status": {
+      "p50Ms": 0.4,
+      "p95Ms": 0.58,
+      "maxLoopDelayMs": 0,
+      "bytes": 250,
+      "samples": 12
+    },
+    "works": {
+      "p50Ms": 1.93,
+      "p95Ms": 7.72,
+      "maxLoopDelayMs": 10.33,
+      "bytes": 3827,
+      "samples": 12
+    },
+    "summary": {
+      "p50Ms": 1.96,
+      "p95Ms": 5.03,
+      "maxLoopDelayMs": 10.23,
+      "bytes": 3827,
+      "samples": 12
+    },
+    "authors": {
+      "p50Ms": 3.08,
+      "p95Ms": 10.9,
+      "maxLoopDelayMs": 10.31,
+      "bytes": 3114,
+      "samples": 12
+    },
+    "authorWorks": {
+      "p50Ms": 8.74,
+      "p95Ms": 16.4,
+      "maxLoopDelayMs": 15.82,
+      "bytes": 3053,
+      "samples": 12
+    },
+    "search": {
+      "p50Ms": 8.33,
+      "p95Ms": 13.34,
+      "maxLoopDelayMs": 16.13,
+      "bytes": 3435,
+      "samples": 12
+    },
+    "detail": {
+      "p50Ms": 0.3,
+      "p95Ms": 1.08,
+      "maxLoopDelayMs": 0,
+      "bytes": 521,
+      "samples": 12
+    },
+    "mediaRange": {
+      "p50Ms": 1.53,
+      "p95Ms": 6.93,
+      "maxLoopDelayMs": 12.04,
+      "bytes": 1024,
+      "samples": 12
+    },
+    "queueWrites": {
+      "p50Ms": 1014.93,
+      "p95Ms": 1420.29,
+      "maxLoopDelayMs": 161.61,
+      "bytes": 250,
+      "samples": 12
+    },
+    "workWrites": {
+      "p50Ms": 996.69,
+      "p95Ms": 1096.69,
+      "maxLoopDelayMs": 155.06,
+      "bytes": 250,
+      "samples": 3
+    },
+    "concurrent8": {
+      "p50Ms": 26.25,
+      "p95Ms": 66.83,
+      "samples": 12
+    }
+  },
+  "memoryMiB": {
+    "rss": 920.5,
+    "heapTotal": 254.8,
+    "heapUsed": 144.3,
+    "external": 11.8,
+    "arrayBuffers": 0.8
+  }
+}

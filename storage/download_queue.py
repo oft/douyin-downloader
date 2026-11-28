@@ -15,7 +15,9 @@ class DownloadQueueStore:
         self.lock = asyncio.Lock()
 
     async def initialize(self):
-        self.connection = await aiosqlite.connect(self.database_path)
+        # Each queue write is one statement. Autocommit makes it durable even
+        # if the caller is cancelled while waiting for the SQLite thread.
+        self.connection = await aiosqlite.connect(self.database_path, isolation_level=None)
         await self.connection.execute("""
             CREATE TABLE IF NOT EXISTS download_queue (
                 scope TEXT NOT NULL, aweme_id TEXT NOT NULL, payload TEXT NOT NULL,
@@ -30,7 +32,6 @@ class DownloadQueueStore:
         await self.connection.execute(
             "UPDATE download_queue SET status='pending' WHERE scope=? AND status='downloading'",
             (self.scope,))
-        await self.connection.commit()
 
     async def close(self):
         if self.connection is not None:
@@ -45,7 +46,6 @@ class DownloadQueueStore:
                 ON CONFLICT(scope, aweme_id) DO UPDATE SET
                     payload=excluded.payload, status='pending', updated_us=excluded.updated_us
             """, (self.scope, str(item["aweme_id"]), json.dumps(item, ensure_ascii=False), now, now))
-            await self.connection.commit()
 
     async def mark(self, aweme_id, status):
         async with self.lock:
@@ -54,7 +54,16 @@ class DownloadQueueStore:
                 "payload=CASE WHEN ?='completed' THEN '{}' ELSE payload END "
                 "WHERE scope=? AND aweme_id=?",
                 (status, time.time_ns() // 1000, status, self.scope, str(aweme_id)))
-            await self.connection.commit()
+
+    async def load_pending(self, aweme_id):
+        async with self.lock:
+            rows = await self.connection.execute_fetchall(
+                "SELECT payload FROM download_queue "
+                "WHERE scope=? AND aweme_id=? AND status='pending'",
+                (self.scope, aweme_id))
+        if not rows:
+            raise RuntimeError("Missing pending download queue entry: {}".format(aweme_id))
+        return json.loads(rows[0][0])
 
     async def pending(self):
         # Keyset pages avoid materializing an author's entire saved metadata in memory.

@@ -9,7 +9,7 @@ import pytest
 
 from utils.browser_runtime import BrowserUnavailableError
 
-SCRIPT = Path(__file__).resolve().parents[1] / "library-server" / "scripts" / "link_checker.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "apps" / "admin" / "scripts" / "link_checker.py"
 spec = importlib.util.spec_from_file_location("library_link_checker", SCRIPT)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)

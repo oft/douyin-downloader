@@ -1,0 +1,13 @@
+{
+  "name": "@zqdouyin/python-bridge",
+  "private": true,
+  "type": "module",
+  "exports": "./index.ts",
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5.0.0"
+  }
+}

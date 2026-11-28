@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import aiosqlite
 import pytest
 
-SCRIPT = Path(__file__).resolve().parents[1] / "library-server" / "scripts" / "update_schedule.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "apps" / "admin" / "scripts" / "update_schedule.py"
 spec = importlib.util.spec_from_file_location("library_update_schedule", SCRIPT)
 schedule_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(schedule_module)

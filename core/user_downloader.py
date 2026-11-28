@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import time
 from importlib.util import find_spec
@@ -68,7 +69,17 @@ class UserDownloader(BaseDownloader):
             self.config.get("number", {}),
             self.config.get("increase", {}),
         )
-        user_info = await self._resolve_user_info_logged(sec_uid, modes)
+        if self.config.get('library_update_tracking', False):
+            budget = float(self.config.get('library_profile_timeout_seconds', 20) or 20)
+            try:
+                user_info = await asyncio.wait_for(self._resolve_user_info_logged(sec_uid, modes), timeout=budget)
+            except asyncio.TimeoutError:
+                callback = getattr(self.progress_reporter, 'on_diagnostic', None)
+                if callable(callback):
+                    callback('author_budget', phase='profile', budgetMs=round(budget * 1000))
+                raise RuntimeError('作者资料获取超过 {} 秒，已保留本地数据，请在诊断中手动重试'.format(budget))
+        else:
+            user_info = await self._resolve_user_info_logged(sec_uid, modes)
         self._progress_report_author(
             nickname=user_info.get("nickname"),
             sec_uid=user_info.get("sec_uid") or sec_uid,
@@ -614,13 +625,20 @@ class UserDownloader(BaseDownloader):
 
         try:
             stream_options = {"on_items": deliver} if on_items is not None else {}
+            library = self.config.get('library_update_tracking', False)
+            timeout = int(browser_cfg.get('wait_timeout_seconds', 600) or 600)
+            idle = int(browser_cfg.get('idle_rounds', 8) or 8)
+            if library:
+                timeout = min(timeout, int(self.config.get('library_history_timeout_seconds', 90) or 90))
+                idle = min(idle, 3)
+                stream_options['first_page_timeout_seconds'] = float(self.config.get('library_first_page_timeout_seconds', 20) or 20)
             browser_aweme_ids = await self.api_client.collect_user_post_ids_via_browser(
                 sec_uid,
                 expected_count=expected_count,
                 headless=bool(browser_cfg.get("headless", False)),
                 max_scrolls=int(browser_cfg.get("max_scrolls", 240) or 240),
-                idle_rounds=int(browser_cfg.get("idle_rounds", 8) or 8),
-                wait_timeout_seconds=int(browser_cfg.get("wait_timeout_seconds", 600) or 600),
+                idle_rounds=idle,
+                wait_timeout_seconds=timeout,
                 **stream_options,
             )
         except (UserUnavailableError, BrowserUnavailableError, BrowserPageAccessError):
@@ -649,6 +667,7 @@ class UserDownloader(BaseDownloader):
 
         if browser_post_stats.get("complete") is False:
             reasons = {"idle": "页面连续滚动未再加载新作品，但未收到分页结束确认",
+                       "first_page_timeout": "首批作品获取超时，请在诊断中手动重试",
                        "max_scrolls": "已达到浏览器滚动次数上限",
                        "timeout": "已达到浏览器采集时间上限",
                        "page_closed": "浏览器页面已关闭",

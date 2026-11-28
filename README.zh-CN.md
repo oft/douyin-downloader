@@ -13,6 +13,31 @@
 
 <a id="douzy-桌面版"></a>
 
+## 本地资料库应用
+
+`apps/admin-web` 是 Vue 管理界面，`apps/admin` 提供管理 API、后台任务并托管构建产物，`apps/viewer` 是只读视频浏览服务。Python 下载核心仍位于根目录的 `core/`、`storage/`、`cli/`。配置、数据库和日志继续使用根目录的 `config.yml`、`data/`、`logs/`。
+
+首次安装需要 Python 3.10+、Node.js 24.12+ 和 Bun 1.4.2。在仓库根目录初始化本地空库：
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -e ".[browser]"
+.venv/bin/python -m playwright install chromium
+.venv/bin/python apps/admin/scripts/setup-library.py --init
+cd apps
+bun install --frozen-lockfile
+bun run build
+bun run --filter @zqdouyin/admin start
+# 另开终端，进入 apps/
+bun run --filter @zqdouyin/viewer start
+```
+
+在 `apps/` 下运行 `bun run check` 和 `bun run test` 检查两个应用。`apps/python-bridge` 负责管理端调用 Python。
+
+打开 [管理页](http://127.0.0.1:3001)，添加自己的作者链接并登录后再手动下载。
+
+[完整安装、Windows 配置与数据切换说明](apps/README.md) · [管理端说明](apps/admin/README.md) · [观看端说明](apps/viewer/README.md)
+
 ## 赞助商
 
 <table>

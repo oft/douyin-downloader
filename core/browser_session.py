@@ -5,6 +5,7 @@ import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from core.local_media_index import LocalMediaIndexes
 from utils.browser_login import prepare_profile, save_browser_login
 from utils.browser_runtime import BrowserUnavailableError, chromium_launch_options
 from utils.cookie_utils import sanitize_cookies
@@ -24,6 +25,7 @@ class BrowserSession:
         self.user_agent = None
         # This is transport evidence for this batch, not a per-author account status.
         self.post_api_requires_browser = False
+        self.local_media_indexes = LocalMediaIndexes()
         self._manager = self._runtime = self._browser = self._context = self._page = None
         self._lock = None
         self._closed = False

@@ -1,5 +1,6 @@
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -62,6 +63,7 @@ class Database:
         # 延迟到首次 _get_conn 调用时在当前 event loop 上创建 Lock，
         # 避免在 __init__ 阶段抢到错误的 loop。
         self._conn_lock: Optional[asyncio.Lock] = None
+        self._write_lock: Optional[asyncio.Lock] = None
 
     async def _get_conn(self) -> aiosqlite.Connection:
         if self._conn is not None:
@@ -72,6 +74,20 @@ class Database:
             if self._conn is None:
                 self._conn = await aiosqlite.connect(self.db_path)
         return self._conn
+
+    @asynccontextmanager
+    async def _write_transaction(self):
+        # The cached connection has one transaction shared by its coroutines.
+        if self._write_lock is None:
+            self._write_lock = asyncio.Lock()
+        async with self._write_lock:
+            db = await self._get_conn()
+            try:
+                yield db
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
 
     async def initialize(self):
         if self._initialized:
@@ -244,13 +260,12 @@ class Database:
         # feature). Treating those as "downloaded" would make like-mode
         # incremental batches stop at the first such row.
         db = await self._get_conn()
-        cursor = await db.execute(
+        rows = await db.execute_fetchall(
             "SELECT id FROM aweme WHERE aweme_id = ? "
             "AND file_path IS NOT NULL AND file_path != ''",
             (aweme_id,),
         )
-        result = await cursor.fetchone()
-        return result is not None
+        return bool(rows)
 
     # Preserving upsert: metadata-ish fields always update, but download
     # artifacts (file_path / metadata / download_time) and enrichments
@@ -336,42 +351,39 @@ class Database:
         author_sec_uid: Optional[str] = None,
     ):
         aweme_data = await prepare_aweme_record(aweme_data, self.download_root)
-        db = await self._get_conn()
         # Prefer the explicit kwarg; fall back to a key on the payload so existing
         # callers (tests, legacy downloaders) keep working.
         sec_uid = author_sec_uid if author_sec_uid is not None else aweme_data.get("author_sec_uid")
-        await db.execute(
-            self._AWEME_UPSERT_SQL,
-            self._aweme_upsert_row(aweme_data, sec_uid, int(datetime.now().timestamp())),
-        )
-        await db.commit()
+        async with self._write_transaction() as db:
+            await db.execute(
+                self._AWEME_UPSERT_SQL,
+                self._aweme_upsert_row(aweme_data, sec_uid, int(datetime.now().timestamp())),
+            )
 
     async def add_aweme_batch(self, items: List[Dict[str, Any]]) -> None:
         """Upsert N awemes in a single transaction (same preserving semantics
         as :meth:`add_aweme`)."""
         if not items:
             return
-        db = await self._get_conn()
         now_ts = int(datetime.now().timestamp())
         prepared = [await prepare_aweme_record(item, self.download_root) for item in items]
         rows = [
             self._aweme_upsert_row(item, item.get("author_sec_uid"), now_ts)
             for item in prepared
         ]
-        await db.executemany(self._AWEME_UPSERT_SQL, rows)
-        await db.commit()
+        async with self._write_transaction() as db:
+            await db.executemany(self._AWEME_UPSERT_SQL, rows)
 
     async def get_latest_aweme_time(self, author_id: str) -> Optional[int]:
         # Same downloaded-only rule as is_downloaded(): non-downloaded rows
         # must not poison the author increment baseline.
         db = await self._get_conn()
-        cursor = await db.execute(
+        rows = await db.execute_fetchall(
             "SELECT MAX(create_time) FROM aweme WHERE author_id = ? "
             "AND file_path IS NOT NULL AND file_path != ''",
             (author_id,),
         )
-        result = await cursor.fetchone()
-        return result[0] if result and result[0] else None
+        return rows[0][0] if rows and rows[0][0] else None
 
     async def add_history(self, history_data: Dict[str, Any]):
         db = await self._get_conn()

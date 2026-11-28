@@ -1986,6 +1986,7 @@ class DouyinAPIClient:
         idle_rounds: int = 8,
         wait_timeout_seconds: int = 600,
         on_items=None,
+        first_page_timeout_seconds=None,
     ) -> List[str]:
         browser_started = time.monotonic()
         target_url = f"{self.BASE_URL}/user/{sec_uid}"
@@ -2006,6 +2007,7 @@ class DouyinAPIClient:
         post_failure_terminal = False
         navigation_failure = ""
         deadline = browser_started + max(30, int(wait_timeout_seconds))
+        first_deadline = browser_started + max(1, float(first_page_timeout_seconds)) if first_page_timeout_seconds is not None else None
         self._browser_post_aweme_items = {}
         self._browser_post_stats = {}
         self._browser_post_profile_uid = str(sec_uid)
@@ -2037,6 +2039,8 @@ class DouyinAPIClient:
                 failure = {"page_closed": "浏览器页面已关闭",
                            "navigation_mismatch": "页面跳转后未到达目标作者主页",
                            "timeout": "浏览器采集等待已超时"}.get(final_reason, "") or navigation_failure
+                if final_reason == 'first_page_timeout':
+                    failure = '首批作品获取超时，请在诊断中手动重试'
                 if not failure and not (post_api_page_hits and post_api_has_more is False):
                     failure = "未收到作者作品分页数据，也未识别到作者作品列表中的作品链接"
             self._browser_post_aweme_items = {} if force_empty else post_api_aweme_items
@@ -2086,7 +2090,11 @@ class DouyinAPIClient:
                         post_failure_terminal = response.status in {401, 403, 429}
                     return
                 try:
-                    data = await response.json()
+                    if first_deadline is not None:
+                        body_budget = min(20, max(.001, first_deadline - time.monotonic())) if not ids else 20
+                        data = await asyncio.wait_for(response.json(), timeout=body_budget)
+                    else:
+                        data = await response.json()
                 except Exception as error:
                     if sequence >= last_page_sequence:
                         last_page_sequence = sequence
@@ -2166,7 +2174,7 @@ class DouyinAPIClient:
 
             try:
                 try:
-                    navigation = await page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    navigation = await page.goto(target_url, wait_until="domcontentloaded", timeout=min(timeout_ms, max(1000, int(first_page_timeout_seconds * 1000))) if first_deadline else timeout_ms)
                     if getattr(navigation, "status", 200) >= 400:
                         post_failure_reason = "用户主页访问返回 HTTP {}".format(navigation.status)
                         return finish("navigation_failed", True)
@@ -2185,7 +2193,10 @@ class DouyinAPIClient:
 
                 title = ""
                 try:
-                    title = await page.title()
+                    if first_deadline is not None:
+                        title = await asyncio.wait_for(page.title(), timeout=max(.001, first_deadline - time.monotonic()))
+                    else:
+                        title = await page.title()
                 except Exception:
                     pass
                 logger.info(
@@ -2194,6 +2205,8 @@ class DouyinAPIClient:
                     safe_log_url(getattr(page, "url", target_url)),
                 )
                 if any(word in title for word in ("验证码", "安全验证", "验证后继续")):
+                    if first_deadline is not None:
+                        raise BrowserPageAccessError('作者主页要求安全验证，已停止更新。请通过手动登录窗口完成验证后继续。')
                     if headless:
                         logger.warning(
                             "检测到验证码页面且当前为 headless 模式，无法人工验证。"
@@ -2221,11 +2234,26 @@ class DouyinAPIClient:
                 try:
                     warmup_seconds = min(20, max(3, int(wait_timeout_seconds)))
                     for _ in range(warmup_seconds):
+                        if first_deadline is not None and not ids and time.monotonic() >= first_deadline:
+                            stop_reason = 'first_page_timeout'
+                            break
                         if page.is_closed():
                             logger.warning("Browser page closed during warmup")
                             break
-                        await self._check_browser_user_available(page)
-                        await merge_profile_cards()
+                        async def warmup():
+                            await self._check_browser_user_available(page)
+                            await merge_profile_cards()
+                        if first_deadline is not None and not ids:
+                            try:
+                                await asyncio.wait_for(warmup(), timeout=max(.001, first_deadline - time.monotonic()))
+                            except asyncio.TimeoutError:
+                                stop_reason = 'first_page_timeout'
+                                break
+                        else:
+                            await warmup()
+                        # Response bodies have a separate bounded read. Delivery can
+                        # wait for real downloads and must not be cancelled by the
+                        # first-page timer after IDs have already arrived.
                         await drain_responses()
                         if ids or post_api_has_more is False or post_failure_terminal:
                             break
@@ -2236,6 +2264,9 @@ class DouyinAPIClient:
                     idle_stop_rounds = max(1, int(idle_rounds))
 
                     for _ in range(max_scroll_rounds):
+                        if first_deadline is not None and not ids and time.monotonic() >= first_deadline:
+                            stop_reason = 'first_page_timeout'
+                            break
                         if page.is_closed():
                             logger.warning("Browser page closed during scrolling")
                             stop_reason = "page_closed"
@@ -2258,6 +2289,8 @@ class DouyinAPIClient:
                         # Keep the normal 1.2s pacing. A slow page gets up to 8s before
                         # this round is considered idle; new data/end-of-list ends the wait.
                         for wait_round in range(18):
+                            if time.monotonic() >= deadline or (first_deadline is not None and not ids and time.monotonic() >= first_deadline):
+                                break
                             await page.wait_for_timeout(1200 if wait_round == 0 else 400)
                             await drain_responses()
                             if not ids:
@@ -2326,7 +2359,7 @@ class DouyinAPIClient:
                     try:
                         if on_items is not None:
                             # Delivery is part of the producer; keep backpressure and cancellation.
-                            if sys.exc_info()[0] is not None:
+                            if sys.exc_info()[0] is not None or stop_reason == 'first_page_timeout':
                                 for task in pending_response_tasks:
                                     task.cancel()
                                 await asyncio.gather(*pending_response_tasks, return_exceptions=True)
